@@ -315,7 +315,7 @@ static void con_out_kvec_add(struct rc_connection *con,
  */
 
 /* data available on socket, or listen socket received a connect */
-static void rc_sock_data_ready(struct sock *sk, int count_unused)
+static void rc_sock_data_ready(struct sock *sk)
 {
 	struct rc_connection *con = sk->sk_user_data;
 	if (!con) {
