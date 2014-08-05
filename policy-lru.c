@@ -12,7 +12,7 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 
-#include "cache.h"
+#include "metadata.h"
 #include "policy.h"
 
 struct lru_policy {
@@ -25,12 +25,12 @@ static struct lru_policy *to_lru_policy(struct remotecache_policy *p)
 	return container_of(p, struct lru_policy, policy);
 }
 
-static void lru_policy_referenced(struct remotecache *cache,
-		struct remotecache_page *page) {
+static void lru_policy_referenced(struct remotecache_metadata *cache,
+		struct remotecache_page_metadata *page) {
 	struct lru_policy *policy = to_lru_policy(cache->policy);
 	if (list_empty(&page->lru)) {
 		BUG_ON(test_and_set_bit(RC_PAGE_LRU, &page->flags));
-		remotecache_page_get(page);
+		remotecache_page_metadata_get(page);
 		list_add(&page->lru, &policy->lru);
 	} else {
 		BUG_ON(!test_bit(RC_PAGE_LRU, &page->flags));
@@ -38,22 +38,22 @@ static void lru_policy_referenced(struct remotecache *cache,
 	}
 }
 
-static void lru_policy_remove(struct remotecache *cache,
-		struct remotecache_page *page)
+static void lru_policy_remove(struct remotecache_metadata *cache,
+		struct remotecache_page_metadata *page)
 {
 	list_del_init(&page->lru);
-	remotecache_page_put(page);
+	remotecache_page_metadata_put(page);
 }
 
 
-static int lru_policy_reclaim(struct remotecache *cache,
+static int lru_policy_reclaim(struct remotecache_metadata *cache,
 		struct list_head *dst, int nr_to_scan) {
 	struct lru_policy *policy = to_lru_policy(cache->policy);
 	int nr_taken = 0, scan;
 
 	for (scan = 0; scan < nr_to_scan && !list_empty(&policy->lru); scan++) {
-		struct remotecache_page *page = list_entry(policy->lru.prev,
-				struct remotecache_page, lru);
+		struct remotecache_page_metadata *page = list_entry(policy->lru.prev,
+				struct remotecache_page_metadata, lru);
 
 		/*
 		 * xxx: testing bit is not enough, we have to lock the page
@@ -66,7 +66,7 @@ static int lru_policy_reclaim(struct remotecache *cache,
 			/*
 			 * drop lru ref
 			 */
-			remotecache_page_put(page);
+			remotecache_page_metadata_put(page);
 			nr_taken++;
 		}
 	}
@@ -124,4 +124,4 @@ module_exit(lru_exit);
 
 MODULE_AUTHOR("Maxime Lorrillere <maxime.lorrillere@lip6.fr>");
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("lru cache policy for remotecache");
+MODULE_DESCRIPTION("lru cache policy for remotecache_metadata");

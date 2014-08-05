@@ -19,6 +19,7 @@
 #include "session.h"
 #include "remotecache.h"
 #include "cache.h"
+#include "metadata.h"
 #include "msgpool.h"
 
 struct remotecache_node *this_node;
@@ -180,7 +181,7 @@ static void remotecache_node_close(struct remotecache_node *node)
 	LIST_HEAD(sessions);
 	LIST_HEAD(metadata);
 	struct remotecache_session *session;
-	struct remotecache *m;
+	struct remotecache_metadata *m;
 	unsigned long flags;
 
 	pr_err("%s close node %p\n", __func__, node);
@@ -205,9 +206,9 @@ static void remotecache_node_close(struct remotecache_node *node)
 	spin_unlock_irqrestore(&node->m_lock, flags);
 
 	while (!list_empty(&metadata)) {
-		m = list_first_entry(&metadata, struct remotecache, list);
+		m = list_first_entry(&metadata, struct remotecache_metadata, list);
 		list_del_init(&m->list);
-		remotecache_put(m);
+		remotecache_metadata_put(m);
 	}
 
 	/* wait for messenger work queue to finish */
@@ -471,17 +472,17 @@ static void remotecache_node_releasepage(struct page *page) {
 	spin_unlock_irqrestore(&cache->lock, flags);
 }
 
-struct remotecache *remotecache_node_metadata(struct remotecache_node *node,
+struct remotecache_metadata *remotecache_node_metadata(struct remotecache_node *node,
 		int pool_id, uuid_le uuid)
 {
 	unsigned long flags;
-	struct remotecache *metadata;
+	struct remotecache_metadata *metadata;
 
 	/* TODO: do the work with UUID */
 	spin_lock_irqsave(&node->m_lock, flags);
 	list_for_each_entry(metadata, &node->metadata, list) {
 		if (metadata->pool_id == pool_id) {
-			remotecache_get(metadata);
+			remotecache_metadata_get(metadata);
 			spin_unlock_irqrestore(&node->m_lock, flags);
 			return metadata;
 		}

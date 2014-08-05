@@ -11,8 +11,8 @@
 
 #include <linux/list.h>
 
-struct remotecache;
-struct remotecache_page;
+struct remotecache_metadata;
+struct remotecache_page_metadata;
 
 /*
  * Cache replacement policy
@@ -21,21 +21,21 @@ struct remotecache_policy {
 	/*
 	 * Mark a page as referenced
 	 */
-	void (*referenced) (struct remotecache *cache,
-			struct remotecache_page *page);
+	void (*referenced) (struct remotecache_metadata *cache,
+			struct remotecache_page_metadata *page);
 
 	/*
 	 * Remove a single page from the page replacement algorithm. This is
 	 * called for exemple when a page is removed from the cache after
 	 * being invalidated.
 	 */
-	void (*remove) (struct remotecache *cache,
-			struct remotecache_page	*page);
+	void (*remove) (struct remotecache_metadata *cache,
+			struct remotecache_page_metadata	*page);
 
 	/*
 	 * Reclaim a batch of pages.
 	 */
-	int (*reclaim) (struct remotecache *cache, struct list_head *dst,
+	int (*reclaim) (struct remotecache_metadata *cache, struct list_head *dst,
 			int nr_to_scan);
 
 	/*
