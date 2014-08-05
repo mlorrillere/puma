@@ -6,8 +6,8 @@
  *	LIP6 - Laboratoire d'Informatique de Paris 6
  */
 
-#ifndef REMOTECACHE_STORE_H
-#define REMOTECACHE_STORE_H
+#ifndef REMOTECACHE_METADATA_H
+#define REMOTECACHE_METADATA_H
 
 #include <linux/kref.h>
 #include <linux/list.h>
@@ -28,7 +28,7 @@
 #define REMOTECACHE_PAGE_POOL_SIZE (1 << 16)
 
 struct page;
-struct remotecache;
+struct remotecache_metadata;
 struct remotecache_policy;
 
 enum remotecache_page_flags {
@@ -42,10 +42,10 @@ enum remotecache_page_flags {
  *
  * Each page of the remote cache is stored in a rbtree
  */
-struct remotecache_page {
+struct remotecache_page_metadata {
 	struct kref kref;
 	struct list_head lru;
-	struct remotecache *cache;
+	struct remotecache_metadata *metadata;
 
 	unsigned long flags;
 	struct rb_node rb_node;
@@ -58,14 +58,14 @@ struct remotecache_page {
 	void *private;
 };
 
-struct remotecache {
+struct remotecache_metadata {
 	struct kref kref;
 	struct list_head list;
 	struct shrinker shrinker;
 	struct remotecache_policy *policy;
 	struct remotecache_session *session;
 
-	int (*evict) (struct remotecache *cache, struct list_head *pages);
+	int (*evict) (struct remotecache_metadata *metadata, struct list_head *pages);
 
 	uuid_le uuid;
 	int pool_id;		/* Compat with cleancache */
@@ -75,41 +75,41 @@ struct remotecache {
 	spinlock_t lock; 	/* lock to protect pages_tree, lru */
 };
 
-void remotecache_init(struct remotecache *cache);
-void remotecache_release(struct kref *ref);
-struct remotecache_page *remotecache_page_alloc(gfp_t gfp_mask);
+void remotecache_metadata_init(struct remotecache_metadata *metadata);
+void remotecache_metadata_release(struct kref *ref);
+struct remotecache_page_metadata *remotecache_page_metadata_alloc(gfp_t gfp_mask);
 
-static inline void remotecache_get(struct remotecache *cache)
+static inline void remotecache_metadata_get(struct remotecache_metadata *metadata)
 {
-	kref_get(&cache->kref);
+	kref_get(&metadata->kref);
 }
 
-static inline void remotecache_put(struct remotecache *cache)
+static inline void remotecache_metadata_put(struct remotecache_metadata *metadata)
 {
-	kref_put(&cache->kref, remotecache_release);
+	kref_put(&metadata->kref, remotecache_metadata_release);
 }
 
-void remotecache_page_free(struct kref *ref);
+void remotecache_page_metadata_free(struct kref *ref);
 
-static inline void remotecache_page_get(struct remotecache_page *page)
+static inline void remotecache_page_metadata_get(struct remotecache_page_metadata *pmd)
 {
-	kref_get(&page->kref);
+	kref_get(&pmd->kref);
 }
 
-static inline void remotecache_page_put(struct remotecache_page *page)
+static inline void remotecache_page_metadata_put(struct remotecache_page_metadata *pmd)
 {
-	kref_put(&page->kref, remotecache_page_free);
+	kref_put(&pmd->kref, remotecache_page_metadata_free);
 }
 
-static inline void remotecache_set_page(struct remotecache_page *rcp,
+static inline void remotecache_metadata_set_page(struct remotecache_page_metadata *pmd,
 		struct page *page)
 {
 	if (page) {
-		if (test_and_set_bit(RC_PAGE_HAS_PAGE, &rcp->flags)) {
+		if (test_and_set_bit(RC_PAGE_HAS_PAGE, &pmd->flags)) {
 			struct page *old;
-			BUG_ON(rcp->private == NULL);
+			BUG_ON(pmd->private == NULL);
 
-			old = rcp->private;
+			old = pmd->private;
 			if (PagePrivate(old)) {
 				ClearPagePrivate(old);
 				ClearPageRemote(old);
@@ -120,16 +120,16 @@ static inline void remotecache_set_page(struct remotecache_page *rcp,
 				put_page(old);
 			}
 		} else {
-			BUG_ON(rcp->private != NULL);
+			BUG_ON(pmd->private != NULL);
 		}
-		rcp->private = page;
+		pmd->private = page;
 		get_page(page);
 	} else {
-		if (test_and_clear_bit(RC_PAGE_HAS_PAGE, &rcp->flags)) {
+		if (test_and_clear_bit(RC_PAGE_HAS_PAGE, &pmd->flags)) {
 			struct page *old;
-			BUG_ON(!rcp->private);
+			BUG_ON(!pmd->private);
 
-			old = rcp->private;
+			old = pmd->private;
 			if (PagePrivate(old)) {
 				ClearPagePrivate(old);
 				ClearPageRemote(old);
@@ -140,109 +140,109 @@ static inline void remotecache_set_page(struct remotecache_page *rcp,
 				put_page(old);
 			}
 
-			rcp->private = NULL;
+			pmd->private = NULL;
 		}
 	}
 }
 
-extern struct remotecache_page *__remotecache_lookup(
-		struct remotecache *cache, ino_t ino, pgoff_t index);
+extern struct remotecache_page_metadata *__remotecache_metadata_lookup(
+		struct remotecache_metadata *metadata, ino_t ino, pgoff_t index);
 
-static inline struct remotecache_page *remotecache_lookup(
-		struct remotecache *cache, ino_t ino, pgoff_t index)
+static inline struct remotecache_page_metadata *remotecache_metadata_lookup(
+		struct remotecache_metadata *metadata, ino_t ino, pgoff_t index)
 {
-	struct remotecache_page *ret = NULL;
+	struct remotecache_page_metadata *ret = NULL;
 
-	spin_lock(&cache->lock);
-	ret = __remotecache_lookup(cache, ino, index);
-	spin_unlock(&cache->lock);
+	spin_lock(&metadata->lock);
+	ret = __remotecache_metadata_lookup(metadata, ino, index);
+	spin_unlock(&metadata->lock);
 
 	return ret;
 }
 
-static inline bool remotecache_contains(struct remotecache *cache,
+static inline bool remotecache_metadata_contains(struct remotecache_metadata *metadata,
 		ino_t ino, pgoff_t index)
 {
-	struct remotecache_page *p =
-		remotecache_lookup(cache, ino, index);
+	struct remotecache_page_metadata *p =
+		remotecache_metadata_lookup(metadata, ino, index);
 	if (p) {
-		remotecache_page_put(p);
+		remotecache_page_metadata_put(p);
 		return true;
 	}
 	return false;
 }
 
-static inline bool __remotecache_contains(struct remotecache *cache,
+static inline bool __remotecache_metadata_contains(struct remotecache_metadata *metadata,
 		ino_t ino, pgoff_t index)
 {
-	struct remotecache_page *p =
-		__remotecache_lookup(cache, ino, index);
+	struct remotecache_page_metadata *p =
+		__remotecache_metadata_lookup(metadata, ino, index);
 	if (p) {
-		remotecache_page_put(p);
+		remotecache_page_metadata_put(p);
 		return true;
 	}
 	return false;
 }
 
-extern struct remotecache_page *__remotecache_lookup_inode(
-		struct remotecache *cache, ino_t ino);
+extern struct remotecache_page_metadata *__remotecache_metadata_lookup_inode(
+		struct remotecache_metadata *metadata, ino_t ino);
 
-static inline struct remotecache_page *remotecache_lookup_inode(
-		struct remotecache *cache, ino_t ino)
+static inline struct remotecache_page_metadata *remotecache_metadata_lookup_inode(
+		struct remotecache_metadata *metadata, ino_t ino)
 {
-	struct remotecache_page *ret = NULL;
+	struct remotecache_page_metadata *ret = NULL;
 
-	spin_lock(&cache->lock);
-	ret = __remotecache_lookup_inode(cache, ino);
-	spin_unlock(&cache->lock);
+	spin_lock(&metadata->lock);
+	ret = __remotecache_metadata_lookup_inode(metadata, ino);
+	spin_unlock(&metadata->lock);
 
 	return ret;
 }
 
 /*
- * Returns a pointer to a page with key rcp->key if it is already in the
+ * Returns a pointer to a page with key pmd->key if it is already in the
  * store.
  */
-extern struct remotecache_page *__remotecache_insert(
-		struct remotecache *cache, struct remotecache_page *new);
+extern struct remotecache_page_metadata *__remotecache_metadata_insert(
+		struct remotecache_metadata *metadata, struct remotecache_page_metadata *new);
 
-static inline struct remotecache_page *remotecache_insert(
-		struct remotecache *cache, struct remotecache_page *new)
+static inline struct remotecache_page_metadata *remotecache_metadata_insert(
+		struct remotecache_metadata *metadata, struct remotecache_page_metadata *new)
 {
-	struct remotecache_page *ret = NULL;
+	struct remotecache_page_metadata *ret = NULL;
 
-	spin_lock(&cache->lock);
-	ret = __remotecache_insert(cache, new);
-	spin_unlock(&cache->lock);
+	spin_lock(&metadata->lock);
+	ret = __remotecache_metadata_insert(metadata, new);
+	spin_unlock(&metadata->lock);
 
 	return ret;
 }
 
-extern void __remotecache_remove(struct remotecache *cache,
-		struct remotecache_page *page);
+extern void __remotecache_metadata_remove(struct remotecache_metadata *metadata,
+		struct remotecache_page_metadata *pmd);
 
-static inline void remotecache_remove(struct remotecache *cache,
-		struct remotecache_page *page)
+static inline void remotecache_metadata_remove(struct remotecache_metadata *metadata,
+		struct remotecache_page_metadata *pmd)
 {
-	spin_lock(&cache->lock);
-	__remotecache_remove(cache, page);
-	spin_unlock(&cache->lock);
+	spin_lock(&metadata->lock);
+	__remotecache_metadata_remove(metadata, pmd);
+	spin_unlock(&metadata->lock);
 }
 
 
-extern bool __remotecache_erase_inode(struct remotecache *cache, ino_t ino);
-extern void __remotecache_remove_inode(struct remotecache *cache,
-		struct remotecache_page *inode);
+extern bool __remotecache_metadata_erase_inode(struct remotecache_metadata *metadata, ino_t ino);
+extern void __remotecache_metadata_remove_inode(struct remotecache_metadata *metadata,
+		struct remotecache_page_metadata *inode);
 
-void __remotecache_clear(struct remotecache *cache);
-bool remotecache_erase(struct remotecache *cache, ino_t ino, pgoff_t index);
-bool __remotecache_erase(struct remotecache *cache, ino_t ino, pgoff_t index);
+void __remotecache_metadata_clear(struct remotecache_metadata *metadata);
+bool remotecache_metadata_erase(struct remotecache_metadata *metadata, ino_t ino, pgoff_t index);
+bool __remotecache_metadata_erase(struct remotecache_metadata *metadata, ino_t ino, pgoff_t index);
 
-void __remotecache_remove_page_list(struct remotecache *, struct list_head *);
+void __remotecache_metadata_remove_page_list(struct remotecache_metadata *, struct list_head *);
 
-bool trylock_remotecache_page(struct remotecache_page *page);
-void lock_remotecache_page(struct remotecache_page *page);
-void unlock_remotecache_page(struct remotecache_page *page);
-void wake_up_remotecache_page(struct remotecache_page *page, int bit);
-void wait_on_remotecache_page_bit(struct remotecache_page *page, int bit);
-#endif /* REMOTECACHE_STORE_H */
+bool trylock_remotecache_page_metadata(struct remotecache_page_metadata *pmd);
+void lock_remotecache_page_metadata(struct remotecache_page_metadata *pmd);
+void unlock_remotecache_page_metadata(struct remotecache_page_metadata *pmd);
+void wake_up_remotecache_page_metadata(struct remotecache_page_metadata *pmd, int bit);
+void wait_on_remotecache_page_metadata_bit(struct remotecache_page_metadata *pmd, int bit);
+#endif /* REMOTECACHE_METADATA_H */
