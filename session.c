@@ -601,8 +601,9 @@ static struct rc_connection *remotecache_session_con_get(struct rc_connection *c
 		container_of(con, struct remotecache_session, con);
 
 	rc_debug("%s %p\n", __func__, con);
-	remotecache_session_get(session);
-	return con;
+	if (kref_get_unless_zero(&session->kref))
+		return con;
+	return NULL;
 }
 
 static void remotecache_session_con_put(struct rc_connection *con)

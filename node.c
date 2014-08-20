@@ -237,8 +237,9 @@ static struct rc_connection *remotecache_node_con_get(struct rc_connection *con)
 		container_of(con, struct remotecache_node, con);
 
 	rc_debug("%s %p\n", __func__, con);
-	remotecache_node_get(node);
-	return con;
+	if (kref_get_unless_zero(&node->kref))
+		return con;
+	return NULL;
 }
 
 static void remotecache_node_con_put(struct rc_connection *con)
