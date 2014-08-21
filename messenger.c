@@ -1066,11 +1066,8 @@ static int write_partial_msg_pages(struct rc_connection *con)
 		ret = rc_tcp_sendpage(con->sock, page,
 				      con->out_msg_pos.page_pos, len, 1);
 		if (ret <= 0) {
-			if (ret < 0) {
+			if (ret < 0)
 				pr_err("%s returned %d", __func__, ret);
-				dump_stack();
-				BUG();
-			}
 			goto out;
 		}
 
