@@ -1359,8 +1359,11 @@ static int read_partial_message(struct rc_connection *con)
 		}
 	}
 
-	if (data_len && (!m->pages || !m->pages[0]) && con->ops->alloc_data)
+	if (data_len && (!m->pages || !m->pages[0]) && con->ops->alloc_data) {
+		unlock_sock_fast(con->sock->sk, fast);
 		con->ops->alloc_data(con, m);
+		fast = lock_sock_fast(con->sock->sk);
+	}
 
 	/* (page) data */
 	while (con->in_msg_pos.data_pos < data_len) {
