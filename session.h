@@ -12,7 +12,7 @@
 #include <linux/time.h>
 #include <linux/kref.h>
 #include <linux/list.h>
-#include <linux/spinlock.h>
+#include <linux/mutex.h>
 #include <linux/cleancache.h>
 
 #include "messenger.h"
@@ -32,9 +32,9 @@ struct remotecache_session {
 
 	struct list_head caches; /* Caches for this host */
 
-	spinlock_t c_lock;	 /* lock to protect ->caches */
+	struct mutex c_lock;	 /* lock to protect ->caches */
 
-	spinlock_t r_lock;	 /* lock to protect ->requests */
+	struct mutex r_lock;	 /* lock to protect ->requests */
 
 	unsigned long flags;
 

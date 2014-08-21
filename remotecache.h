@@ -55,6 +55,7 @@ struct rc_get_response {
 	__le64 req_id;
 	__le32 pool_id;	/* identifier of the source filesystem */
 	__le64 ino;	/* inode number from where the pages comes from */
+	u8 nr_miss;
 } __packed;
 
 struct rc_put_request_middle {
@@ -68,6 +69,7 @@ struct rc_get_response_middle {
 
 struct rc_get_request_middle {
 	__le64 index;	/* logical offset of the page within the inode */
+	u8 nr_pages;	/* number of consecutive pages starting from index */
 } __packed;
 
 struct rc_invalidate_fs_request {

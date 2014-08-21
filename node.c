@@ -40,7 +40,7 @@ static int remotecache_node_connect(struct remotecache_node *node,
 static void remotecache_node_start_plug(struct remotecache_plug *plug);
 static void remotecache_node_finish_plug(struct remotecache_plug *plug);
 static void remotecache_node_flush_plug(struct task_struct *tsk);
-static void remotecache_node_releasepage(struct page *page);
+static int remotecache_node_releasepage(struct page *page);
 
 /*
  * Module parameters
@@ -449,28 +449,37 @@ static void remotecache_node_flush_plug(struct task_struct *tsk)
 	}
 }
 
-static void remotecache_node_releasepage(struct page *page) {
-	struct remotecache_page *rcp = (void*)page->private;
-	struct remotecache *cache = rcp->cache;
+static int remotecache_node_releasepage(struct page *page) {
+	struct remotecache_inode *inode = (void*)page->private;
+	struct remotecache *cache = inode->cache;
 	struct remotecache_session *session = cache->session;
-	unsigned long flags;
+	pgoff_t index = page->index;
 
-	BUG_ON(!test_and_clear_bit(RC_PAGE_HAS_PAGE, &rcp->flags));
+	spin_lock(&inode->lock);
+	/*
+	 * Non racy check for a busy page (similar to __remove_mapping).
+	 */
+	if (!page_freeze_refs(page, 2)) {
+		spin_unlock(&inode->lock);
+		return 0;
+	}
+	WARN_ON(!radix_tree_delete_item(&inode->pages_tree, page->index, page));
+	spin_unlock(&inode->lock);
 
+	WARN_ON(!TestClearPageRemote(page));
 	ClearPagePrivate(page);
-	ClearPageRemote(page);
 	set_page_private(page, 0);
 	__dec_zone_page_state(page, NR_FILE_PAGES);
-	put_page(page);
-	rcp->private = NULL;
+	atomic_dec(&cache->size);
 
-	if (!__invalidate_page(session, cache->pool_id, rcp->ino, rcp->index)) {
-		pr_warn("%s: cannot invalidate rcp %p (%d,%lu,%lu)", __func__,
-				rcp, cache->pool_id, rcp->ino, rcp->index);
+	if (!__invalidate_page(session, cache->pool_id, inode->ino, index)) {
+		pr_warn("%s: cannot invalidate page %p (%d,%lu,%lu)", __func__,
+				page, cache->pool_id, inode->ino, index);
 	}
-	spin_lock_irqsave(&cache->lock, flags);
-	__remotecache_remove(cache, rcp);
-	spin_unlock_irqrestore(&cache->lock, flags);
+
+	page_unfreeze_refs(page, 1);
+
+	return 1;
 }
 
 struct remotecache_metadata *remotecache_node_metadata(struct remotecache_node *node,
@@ -758,7 +767,8 @@ static ssize_t node_show_stats(struct rc_stats *stats, char *buf)
 {
 	ssize_t count = 0;
 	unsigned long flags;
-	struct remotecache *m, *c;
+	struct remotecache_metadata *m;
+	struct remotecache *c;
 	struct remotecache_session *s;
 	struct remotecache_node *n = container_of(stats,
 			struct remotecache_node, stats);
