@@ -180,7 +180,6 @@ struct remotecache_page_metadata *__remotecache_metadata_insert(struct remotecac
 		rb_insert_color(&new->rb_node, &metadata->pages_tree);
 		atomic_inc(&metadata->size);
 		remotecache_page_metadata_get(new);
-		new->metadata = metadata;
 
 		metadata->policy->referenced(metadata, new);
 	} else {
@@ -295,7 +294,6 @@ static void remotecache_page_metadata_init(struct remotecache_page_metadata *pmd
 	INIT_LIST_HEAD(&pmd->lru);
 	RB_CLEAR_NODE(&pmd->rb_node);
 
-	pmd->metadata = NULL;
 	pmd->flags = 0;
 	pmd->ino = 0;
 	pmd->index = 0;

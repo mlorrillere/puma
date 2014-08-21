@@ -45,7 +45,6 @@ enum remotecache_page_flags {
 struct remotecache_page_metadata {
 	struct kref kref;
 	struct list_head lru;
-	struct remotecache_metadata *metadata;
 
 	unsigned long flags;
 	struct rb_node rb_node;
