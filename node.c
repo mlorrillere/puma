@@ -372,6 +372,7 @@ static struct remotecache_ops remotecache_node_ops = {
 	.releasepage = remotecache_node_releasepage,
 	.readpage = remotecache_node_readpage,
 	.readpages = remotecache_node_readpages,
+	.ll_rw_block = remotecache_node_ll_rw_block,
 	.suspend = remotecache_node_suspend_op,
 	.resume = remotecache_node_resume_op
 };

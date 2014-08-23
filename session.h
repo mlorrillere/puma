@@ -61,6 +61,8 @@ struct remotecache_request {
 		struct page *page;
 	};
 
+	struct buffer_head *bh;
+
 	unsigned nr_pages;	/* Number of pages */
 	atomic_t nr_received;	/* Number of pages already handled */
 	bool has_pages;		/* use of ->page or ->pages ? */

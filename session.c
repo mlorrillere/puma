@@ -1251,6 +1251,7 @@ static struct remotecache_request *remotecache_request_create(
 	request->has_pages = (nr_pages > 0);
 	request->nr_pages = 0;
 	request->session = session;
+	request->bh = NULL;
 
 	return request;
 }
@@ -1422,6 +1423,11 @@ static void __handle_get_response(struct remotecache_session *session,
 			int i;
 			for (i = 0; i < request->nr_pages; ++i)
 				unlock_page(request->pages[i]);
+		} else if (request->bh) {
+			rc_debug("%s calling b_end_io(%p, %d)\n", __func__,
+				request->bh, PageUptodate(request->page));
+			request->bh->b_end_io(request->bh,
+				PageUptodate(request->page));
 		} else {
 			unlock_page(request->page);
 		}
@@ -1914,6 +1920,54 @@ int remotecache_node_readpage(struct file *file, struct page *page)
 
 readpage:
 	return page->mapping->a_ops->readpage(file, page);
+}
+
+void remotecache_node_ll_rw_block(int rw, struct buffer_head *bh)
+{
+	struct remotecache_request *request;
+	struct remotecache_session *session;
+	struct address_space *mapping = bh->b_page->mapping;
+
+	rc_debug("%s bh %p page %p ino %lu index %lu\n", __func__,
+			bh, bh->b_page, mapping->host->i_ino,
+			bh->b_page->index);
+
+	if (!cleancache_fs_enabled(bh->b_page)) {
+		rc_debug("%s: cleancache disabled", __func__);
+		goto submit;
+	}
+
+	session = remotecache_node_session(this_node);
+	if (!session) {
+		pr_err("%s: not connected to a remote node\n", __func__);
+		goto submit;
+	}
+
+	request = remotecache_request_create(session, 0);
+	if (!request) {
+		pr_err("Can't allocate request");
+		goto submit;
+	}
+
+	if (__request_add_page(bh->b_page, mapping, request)) {
+		mutex_lock(&session->r_lock);
+		list_add_tail(&request->list, &session->requests);
+		mutex_unlock(&session->r_lock);
+
+		if (request->page) {
+			request->bh = bh;
+			__send_request(session, request, mapping);
+		}
+		remotecache_request_put(request);
+	} else {
+		remotecache_request_put(request);
+		goto submit;
+	}
+
+	return;
+
+submit:
+	submit_bh(rw, bh);
 }
 
 int remotecache_node_readpages(struct file *file,
