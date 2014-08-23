@@ -85,7 +85,7 @@ void remotecache_inode_release(struct kref *ref)
 	struct page *pages[16];
 	int n;
 
-	rc_debug("%s %p %lu", __func__, inode, inode->ino);
+	rc_debug("%s %p %lu\n", __func__, inode, inode->ino);
 
 	do {
 		int i;
@@ -109,23 +109,23 @@ void remotecache_inode_release(struct kref *ref)
 		spin_unlock(&inode->lock);
 
 		/*
-		 * synchronize_rcu as radix_tree_*_lookup does not returns
-		 * pages with refcount increased
+		 * There is no need to synchronize_rcu as __handle_get checks
+		 * if the slot has changed after increasing the ref count on
+		 * the page
 		 */
-		synchronize_rcu();
-
 		for (i = 0; i < n; ++i) {
 			struct page *p = pages[i];
 
-			WARN_ON(!TestClearPageRemote(p));
-			ClearPagePrivate(p);
-			set_page_private(p, 0);
-			__dec_zone_page_state(p, NR_FILE_PAGES);
+			if (TestClearPageRemote(p)) {
+				ClearPagePrivate(p);
+				set_page_private(p, 0);
+				__dec_zone_page_state(p, NR_FILE_PAGES);
 
-			/*
-			 * Release page cache ref
-			 */
-			page_cache_release(p);
+				/*
+				 * Release page cache ref
+				 */
+				page_cache_release(p);
+			}
 
 			/*
 			 * Drop last ref
@@ -133,6 +133,7 @@ void remotecache_inode_release(struct kref *ref)
 			put_page(p);
 		}
 		atomic_sub(n, &inode->cache->size);
+		cond_resched();
 	} while (n > 0);
 
 	kmem_cache_free(remotecache_inode_cachep, inode);

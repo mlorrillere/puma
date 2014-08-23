@@ -324,8 +324,6 @@ static void __handle_put(struct remotecache_session *session, struct rc_msg *msg
 			void **slot;
 			struct page *old, *new;
 
-			spin_lock(&inode->lock);
-
 			/*
 			 * Add the new page to the system LRU
 			 */
@@ -343,6 +341,7 @@ static void __handle_put(struct remotecache_session *session, struct rc_msg *msg
 			/*
 			 * Lookup for the old page. If found, replace it.
 			 */
+			spin_lock(&inode->lock);
 			slot = radix_tree_lookup_slot(&inode->pages_tree, index);
 			if (!slot) {
 				rc_debug("%s insert new page %p index %lu\n",
@@ -359,16 +358,16 @@ static void __handle_put(struct remotecache_session *session, struct rc_msg *msg
 				 * cache and from the system LRU
 				 */
 				if (old && get_page_unless_zero(old)) {
-						WARN_ON(!TestClearPageRemote(old));
-						ClearPagePrivate(old);
-						set_page_private(old, 0);
-						__dec_zone_page_state(old, NR_FILE_PAGES);
-						put_page(old); //radix tree ref
+						if (TestClearPageRemote(old)) {
+							ClearPagePrivate(old);
+							set_page_private(old, 0);
+							__dec_zone_page_state(old, NR_FILE_PAGES);
+							put_page(old); //radix tree ref
+							atomic_dec(&cache->size);
+						}
 						put_page(old); //get_page_unless_zero ref
-						atomic_dec(&cache->size);
 				}
 			}
-
 			spin_unlock(&inode->lock);
 
 			rc_debug("%s insert page %p pool %d ino %lu index %lu\n",
@@ -405,8 +404,7 @@ static void __handle_get(struct remotecache_session *session, struct rc_msg *msg
 	struct rc_get_response_middle *rmid;
 	unsigned nr_pages =
 		msg->middle.iov_len/sizeof(struct rc_get_response_middle);
-	struct remotecache *cache = session_get_cache(session,
-			le32_to_cpu(request->pool_id), NULL_UUID_LE);
+	struct remotecache *cache;
 	struct remotecache_inode *inode;
 
 	int pool_id = le32_to_cpu(request->pool_id);
@@ -414,6 +412,9 @@ static void __handle_get(struct remotecache_session *session, struct rc_msg *msg
 
 	BUG_ON(msg->front.iov_len != sizeof(*request));
 	BUG_ON(nr_pages == 0);
+
+	cache = session_get_cache(session, le32_to_cpu(request->pool_id),
+			NULL_UUID_LE);
 
 	res = rc_msg_new(RC_MSG_TYPE_GET_RESPONSE,
 			sizeof(struct rc_get_response),
@@ -451,11 +452,9 @@ static void __handle_get(struct remotecache_session *session, struct rc_msg *msg
 			continue;
 
 		rcu_read_lock();
-		radix_tree_for_each_slot(slot, &inode->pages_tree, &iter, index) {
-			struct page *p;
+		radix_tree_for_each_contig(slot, &inode->pages_tree, &iter, index) {
+			struct page *p = NULL;
 
-			if (iter.index >= index + middle->nr_pages)
-				break;
 repeat:
 			p = radix_tree_deref_slot(slot);
 			if (unlikely(!p))
