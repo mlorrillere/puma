@@ -152,11 +152,6 @@ struct rc_connection {
 	struct list_head list;	/* Might be used to link connections together,
 				   mainly when used as a listening connection */
 
-	/* out plug */
-	/*atomic_t plug_count;
-	unsigned plug_size;
-	struct list_head out_plug;*/
-
 	/* out queue */
 	struct list_head out_queue;
 	struct list_head out_sent;

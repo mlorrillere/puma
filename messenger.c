@@ -1482,7 +1482,7 @@ more_kvec:
 
 			if (rc_msg_test_flag(con->out_msg, RC_MSG_FLAG_URG)) {
 				set_bit(CON_FLAG_URG, &con->flags);
-				rc_debug("%s found urgent flag on %p",
+				rc_debug("%s found urgent flag on %p\n",
 						__func__, con->out_msg);
 			}
 
@@ -1572,7 +1572,7 @@ out:
 
 	if (test_and_clear_bit(CON_FLAG_URG, &con->flags)) {
 		int nodelay = 1;
-		rc_debug("%s urgent flag set, force push", __func__);
+		rc_debug("%s urgent flag set, force push\n", __func__);
 		kernel_setsockopt(con->sock, IPPROTO_TCP, TCP_NODELAY,
 				(void*)&nodelay, sizeof(nodelay));
 	}
@@ -1668,7 +1668,7 @@ more:
 		con->in_seq++;
 		if (rc_msg_test_flag(con->in_msg, RC_MSG_FLAG_URG)) {
 			set_bit(CON_FLAG_URG, &con->flags);
-			rc_debug("%s found urgent flag on %p", __func__, con->in_msg);
+			rc_debug("%s found urgent flag on %p\n", __func__, con->in_msg);
 		}
 
 		ret = 1;
