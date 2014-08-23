@@ -773,7 +773,7 @@ static ssize_t node_show_stats(struct rc_stats *stats, char *buf)
 	struct remotecache_session *s;
 	struct remotecache_node *n = container_of(stats,
 			struct remotecache_node, stats);
-	struct timespec get_avg, get_msg_avg, put_avg, put_msg_avg;
+	struct timespec get_avg, get_msg_avg, put_avg, put_msg_avg, send_avg;
 
 	get_avg = timespec_avg(&n->stats.get_avg_time, n->stats.nget);
 	get_msg_avg = timespec_avg(&n->stats.get_avg_time,
@@ -781,6 +781,7 @@ static ssize_t node_show_stats(struct rc_stats *stats, char *buf)
 	put_avg = timespec_avg(&n->stats.put_avg_time, n->stats.nput);
 	put_msg_avg = timespec_avg(&n->stats.put_avg_time,
 			n->stats.nput_msg);
+	send_avg = timespec_avg(&n->stats.send_avg_time, n->stats.nsend);
 
 	/* Summary version, better for parsing */
 	count += scnprintf(buf, PAGE_SIZE,
@@ -826,6 +827,15 @@ static ssize_t node_show_stats(struct rc_stats *stats, char *buf)
 	list_for_each_entry(s, &n->sessions, list) {
 		count += scnprintf(buf+count, PAGE_SIZE-count,
 			"\thost: %s\n", rc_pr_addr(&s->con.peer_addr));
+		count += scnprintf(buf+count, PAGE_SIZE-count,
+				"\t\tsend avg %lu.%09lu min %lu.%09lu " \
+				"max %lu.%09lu\n",
+				send_avg.tv_sec,
+				send_avg.tv_nsec,
+				s->con.stats->send_min_time.tv_sec,
+				s->con.stats->send_min_time.tv_nsec,
+				s->con.stats->send_max_time.tv_sec,
+				s->con.stats->send_max_time.tv_nsec);
 		list_for_each_entry(c, &s->caches, list) {
 			count += scnprintf(buf+count, PAGE_SIZE-count,
 				"\t\t%pUl %d %d\n", &c->uuid, c->pool_id,
