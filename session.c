@@ -1115,13 +1115,15 @@ static void __remotecache_invalidate_page(int pool_id, struct cleancache_filekey
 	/*
 	 * See comment for __handle_invalidate_page
 	 */
-	/*if (erased) {
-		if (!__invalidate_page(session, pool_id, key.u.ino, index)) {
+	if (erased) {
+		/*if (!__invalidate_page(session, pool_id, key.u.ino, index)) {
 			printk(KERN_ERR "%s: cannot allocate struct rc_msg: out of memory", __func__);
 			dump_stack();
 			BUG();
-		}
-	}*/
+		}*/
+
+		this_node->stats.n_invalidate_pages++;
+	}
 
 	remotecache_metadata_put(metadata);
 }
@@ -1349,10 +1351,11 @@ static void __handle_get_response(struct remotecache_session *session,
 	struct remotecache_request *request = NULL;
 	struct rc_get_response *res = msg->front.iov_base;
 	struct rc_get_response_middle *middle = msg->middle.iov_base;
-	int n, nr_middle = msg->middle.iov_len / sizeof(*middle);
+	int nr_middle = msg->middle.iov_len / sizeof(*middle);
 	pgoff_t index;
 	int pool_id = le32_to_cpu(res->pool_id);
 	ino_t ino = le64_to_cpu(res->ino);
+	int i;
 	struct remotecache_metadata *metadata=
 		remotecache_node_metadata(this_node, pool_id, NULL_UUID_LE);
 
@@ -1368,16 +1371,14 @@ static void __handle_get_response(struct remotecache_session *session,
 	BUG_ON(request->nr_pages < nr_middle);
 
 	rc_debug("%s session %p msg %p request %p rid %lu (%lu) " \
-			"nr_middle = %u nr_pages = %u nr_miss= %hhu",
+			"nr_middle = %u nr_pages = %u nr_miss= %hhu\n",
 			__func__, session, msg, request, request->id,
 			(unsigned long) le64_to_cpu(res->req_id),
 			nr_middle, msg->nr_pages, res->nr_miss);
 
-	msg->nr_pages = 0;
-
-	for (n = nr_middle-1; n >= 0; --n) {
-		struct page *page = msg->pages[n];
-		middle = msg->middle.iov_base+sizeof(*middle)*n;
+	for (i = 0; i < msg->nr_pages; ++i) {
+		struct page *page = msg->pages[i];
+		middle = msg->middle.iov_base+sizeof(*middle)*i;
 		index = le64_to_cpu(middle->index);
 		BUG_ON(page->index != index);
 
@@ -1404,8 +1405,6 @@ static void __handle_get_response(struct remotecache_session *session,
 		}
 #endif
 		SetPageUptodate(page);
-		rc_debug("%s got page pool %d ino %lu index %lu\n",
-				__func__, pool_id, ino, index);
 	}
 	this_node->stats.n_rc_hit += nr_middle;
 	this_node->stats.n_rc_miss += res->nr_miss;
@@ -1415,7 +1414,7 @@ static void __handle_get_response(struct remotecache_session *session,
 	/*
 	 * Free request and update stats if we received enough responses
 	 */
-	if (atomic_add_return(nr_middle+res->nr_miss, &request->nr_received) == request->nr_pages) {
+	if (atomic_add_return(msg->nr_pages+res->nr_miss, &request->nr_received) == request->nr_pages) {
 		struct timespec delay;
 
 		if (request->has_pages) {
@@ -1441,6 +1440,7 @@ static void __handle_get_response(struct remotecache_session *session,
 		remotecache_request_put(request);
 	}
 
+	msg->nr_pages = 0;
 	rc_msg_put(msg);
 }
 
