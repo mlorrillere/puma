@@ -473,7 +473,7 @@ static int remotecache_node_releasepage(struct page *page) {
 	__dec_zone_page_state(page, NR_FILE_PAGES);
 	atomic_dec(&cache->size);
 
-	if (!__invalidate_page(session, cache->pool_id, inode->ino, index)) {
+	if (!do_invalidate_page(session, cache->pool_id, inode->ino, index, true)) {
 		pr_warn("%s: cannot invalidate page %p (%d,%lu,%lu)", __func__,
 				page, cache->pool_id, inode->ino, index);
 	}

@@ -86,6 +86,6 @@ static inline void remotecache_session_put(struct remotecache_session *session)
 void remotecache_session_close(struct remotecache_session *session);
 struct remotecache_session *remotecache_session_create(struct remotecache_node *);
 
-bool __invalidate_page(struct remotecache_session *session,
-		int pool_id, ino_t ino, pgoff_t index);
+bool do_invalidate_page(struct remotecache_session *session,
+		int pool_id, ino_t ino, pgoff_t index, bool metadata);
 #endif //SESSION_H

@@ -161,13 +161,17 @@ static struct remotecache *session_get_cache(
 
 /*
  * Dispatch functions
+ *
+ * If metadata is true, then we want to invalidate peer's metadata? Otherwise
+ * we want to invalidate the page stored remotely.
  */
-bool __invalidate_page(struct remotecache_session *session,
-		int pool_id, ino_t ino, pgoff_t index)
+bool do_invalidate_page(struct remotecache_session *session,
+		int pool_id, ino_t ino, pgoff_t index, bool metadata)
 {
 	struct rc_msg *request = NULL;
 	struct rc_invalidate_page_request *inv;
 	struct rc_invalidate_page_request_middle *middle;
+	gfp_t gfp = metadata ? GFP_NOWAIT : GFP_KERNEL;
 
 	rc_debug("%s: invalidating page (%d,%lu,%lu)\n",
 			__func__, pool_id, ino, index);
@@ -177,6 +181,9 @@ bool __invalidate_page(struct remotecache_session *session,
 		goto new_request;
 
 	if (le16_to_cpu(request->header.type) != RC_MSG_TYPE_INVALIDATE_PAGE)
+		goto new_request;
+
+	if (metadata && !rc_msg_test_flag(request, RC_MSG_FLAG_INVALIDATE_PMD))
 		goto new_request;
 
 	inv = request->front.iov_base;
@@ -210,7 +217,7 @@ bool __invalidate_page(struct remotecache_session *session,
 	} else {
 new_request:
 		rc_con_flush_plug(&session->con, current);
-		request = rc_msgpool_get(&remotecache_inv_cachep, GFP_NOWAIT,
+		request = rc_msgpool_get(&remotecache_inv_cachep, gfp,
 				sizeof(*inv), sizeof(*middle)*64, 0);
 		if (!request)
 			return false;
@@ -224,6 +231,9 @@ new_request:
 		middle->ino	= cpu_to_le64(ino);
 		middle->index	= cpu_to_le64(index);
 		middle->nr_pages = 1;
+
+		if (metadata)
+			rc_msg_set_flag(request, RC_MSG_FLAG_INVALIDATE_PMD);
 
 		rc_con_send(&session->con, request);
 	}
@@ -357,15 +367,24 @@ static void __handle_put(struct remotecache_session *session, struct rc_msg *msg
 				 * Old page found, remove it from the remote
 				 * cache and from the system LRU
 				 */
-				if (old && get_page_unless_zero(old)) {
-						if (TestClearPageRemote(old)) {
-							ClearPagePrivate(old);
-							set_page_private(old, 0);
-							__dec_zone_page_state(old, NR_FILE_PAGES);
-							put_page(old); //radix tree ref
-							atomic_dec(&cache->size);
-						}
-						put_page(old); //get_page_unless_zero ref
+				if (old) {
+					BUG_ON(!get_page_unless_zero(old));
+					if (TestClearPageRemote(old)) {
+						ClearPagePrivate(old);
+						set_page_private(old, 0);
+						__dec_zone_page_state(old, NR_FILE_PAGES);
+
+						/*
+						 * Release page cache ref
+						 */
+						page_cache_release(old);
+						atomic_dec(&cache->size);
+					}
+
+					/*
+					 * Drop last ref
+					 */
+					put_page(old);
 				}
 			}
 			spin_unlock(&inode->lock);
@@ -502,27 +521,25 @@ repeat:
 		 */
 		if (remotecache_strategy == RC_STRATEGY_EXCLUSIVE) {
 			spin_lock(&inode->lock);
-			for (i = 0; i < n; ++i)
+			for (i = 0; i < n; ++i) {
 				pages[i] = radix_tree_delete(&inode->pages_tree, index+i);
+				if (pages[i])
+					get_page(pages[i]);
+			}
 			spin_unlock(&inode->lock);
-
-			/*
-			 * synchronize_rcu as radix_tree_*_lookup does not
-			 * returns pages with refcount increased
-			 */
-			synchronize_rcu();
 
 			for (i = 0; i < n; ++i) {
 				struct page *p = pages[i];
-				if (p && get_page_unless_zero(p)) {
-					WARN_ON(!TestClearPageRemote(p));
+				if (!p)
+					continue;
+				if (TestClearPageRemote(p)) {
 					ClearPagePrivate(p);
 					set_page_private(p, 0);
 					__dec_zone_page_state(p, NR_FILE_PAGES);
 					page_cache_release(p);
 					atomic_dec(&cache->size);
-					put_page(p);
 				}
+				put_page(p);
 			}
 		}
 	}
@@ -599,13 +616,79 @@ static void __handle_invalidate_ino(struct remotecache_session *session,
 	rc_msg_put(msg);
 }
 
-/*
- * INVALIDATE_PAGE message is sent both client side when the VFS invalidate a
- * page, and server side when a victim page is evicted from the remote page
- * cache. The first case is very infrequent, so we only handle the second case
- * until a good solution is found.
- */
-static void __handle_invalidate_page(struct remotecache_session *session,
+static void __invalidate_page(struct remotecache_session *session,
+		struct rc_msg *msg)
+{
+	struct rc_invalidate_page_request *inv_page = msg->front.iov_base;
+	struct rc_invalidate_page_request_middle *middle, *endp;
+	struct remotecache *cache;
+	int pool_id;
+
+	BUG_ON(le16_to_cpu(msg->header.type) != RC_MSG_TYPE_INVALIDATE_PAGE);
+	BUG_ON(msg->front.iov_len != sizeof(*inv_page));
+
+	pool_id = le32_to_cpu(inv_page->pool_id);
+	rc_debug("%s invalidate page request on pool %d\n", __func__, pool_id);
+
+	middle = msg->middle.iov_base;
+	endp = msg->middle.iov_base + msg->middle.iov_len;
+
+	cache = session_get_cache(session, pool_id, NULL_UUID_LE);
+	while (middle < endp) {
+		struct remotecache_inode *inode;
+		ino_t ino = le64_to_cpu(middle->ino);
+		pgoff_t index= le64_to_cpu(middle->index);
+		int n = middle->nr_pages;
+
+		rcu_read_lock();
+		inode = __remotecache_lookup_inode(cache, ino);
+		rcu_read_unlock();
+
+		do {
+			struct page *pages[16];
+			int i, batch = min_t(int, n, ARRAY_SIZE(pages));
+
+			spin_lock(&inode->lock);
+			for (i = 0; i < batch; i++) {
+				pages[i] = radix_tree_delete(&inode->pages_tree, index++);
+				if (pages[i])
+					get_page(pages[i]);
+			}
+			spin_unlock(&inode->lock);
+
+			for (i = 0; i < batch; i++) {
+				struct page *p = pages[i];
+				if (!p)
+					break;
+				if (TestClearPageRemote(p)) {
+					ClearPagePrivate(p);
+					set_page_private(p, 0);
+					__dec_zone_page_state(p, NR_FILE_PAGES);
+
+					/*
+					 * Release page cache ref
+					 */
+					page_cache_release(p);
+				}
+
+				/*
+				 * Drop last ref
+				 */
+				put_page(p);
+			}
+
+			n -= batch;
+			atomic_sub(batch, &cache->size);
+			cond_resched();
+		} while (n > 0);
+
+		remotecache_inode_put(inode);
+		middle++;
+	}
+	remotecache_put(cache);
+}
+
+static void __invalidate_page_metadata(struct remotecache_session *session,
 		struct rc_msg *msg)
 {
 	struct rc_invalidate_page_request *inv_page = msg->front.iov_base;
@@ -619,7 +702,7 @@ static void __handle_invalidate_page(struct remotecache_session *session,
 	BUG_ON(msg->front.iov_len != sizeof(*inv_page));
 
 	pool_id = le32_to_cpu(inv_page->pool_id);
-	rc_debug("Handling INVALIDATE_PAGE request on pool %d", pool_id);
+	rc_debug("%s invalidate page request on pool %d\n", __func__, pool_id);
 
 	middle = msg->middle.iov_base;
 	endp = msg->middle.iov_base + msg->middle.iov_len;
@@ -656,6 +739,25 @@ static void __handle_invalidate_page(struct remotecache_session *session,
 	this_node->stats.n_remote_invalidate += count;
 
 	remotecache_metadata_put(metadata);
+}
+
+/*
+ * INVALIDATE_PAGE message is sent both client side when the VFS invalidate a
+ * page, and server side when a victim page is evicted from the remote page
+ * cache. For the first case, the RC_MSG_FLAG_INVALIDATE_PMD flag has been set
+ * by the server case so we know that we have to lookup for metadata.
+ */
+static void __handle_invalidate_page(struct remotecache_session *session,
+		struct rc_msg *msg)
+{
+	BUG_ON(le16_to_cpu(msg->header.type) != RC_MSG_TYPE_INVALIDATE_PAGE);
+	BUG_ON(msg->front.iov_len != sizeof(struct rc_invalidate_page_request));
+
+	if (rc_msg_test_flag(msg, RC_MSG_FLAG_INVALIDATE_PMD))
+		__invalidate_page_metadata(session, msg);
+	else
+		__invalidate_page(session, msg);
+
 	rc_msg_put(msg);
 }
 
@@ -1116,11 +1218,8 @@ static void __remotecache_invalidate_page(int pool_id, struct cleancache_filekey
 	 * See comment for __handle_invalidate_page
 	 */
 	if (erased) {
-		/*if (!__invalidate_page(session, pool_id, key.u.ino, index)) {
-			printk(KERN_ERR "%s: cannot allocate struct rc_msg: out of memory", __func__);
-			dump_stack();
-			BUG();
-		}*/
+		if (!do_invalidate_page(session, pool_id, key.u.ino, index, false))
+			pr_warn("%s: cannot invalidate page: out of memory", __func__);
 
 		this_node->stats.n_invalidate_pages++;
 	}
@@ -1361,7 +1460,6 @@ static void __handle_get_response(struct remotecache_session *session,
 
 	BUG_ON(msg->front.iov_len != sizeof(*res));
 	BUG_ON(!msg->middle.iov_base);
-	BUG_ON(rc_msg_test_flag(msg, RC_MSG_FLAG_NOT_FOUND) && msg->nr_pages);
 
 	/* looking for corresponding pending request */
 	mutex_lock(&session->r_lock);
@@ -1614,7 +1712,9 @@ static void remotecache_session_alloc_data(struct rc_connection *con, struct rc_
 	if (le16_to_cpu(msg->header.type) == RC_MSG_TYPE_GET_RESPONSE) {
 		struct remotecache_request *request;
 		struct rc_get_response *response = msg->front.iov_base;
-		unsigned nr_pages = le32_to_cpu(msg->header.data_len)/PAGE_SIZE;
+		struct rc_get_response_middle *middle;
+		unsigned n, nr_middle = msg->middle.iov_len / sizeof(*middle),
+			 nr_pages = le32_to_cpu(msg->header.data_len)/PAGE_SIZE;
 
 		mutex_lock(&session->r_lock);
 		request = __remotecache_request_lookup(session,
@@ -1624,28 +1724,23 @@ static void remotecache_session_alloc_data(struct rc_connection *con, struct rc_
 
 		BUG_ON(nr_pages > request->nr_pages);
 
-		if (!rc_msg_test_flag(msg, RC_MSG_FLAG_NOT_FOUND)) {
-			struct rc_get_response_middle *middle;
-			unsigned n, nr_middle = msg->middle.iov_len / sizeof(*middle);
+		for (n = 0; n < nr_middle; ++n) {
+			pgoff_t index;
+			struct page *page;
+			middle = msg->middle.iov_base+sizeof(*middle)*n;
+			index = le64_to_cpu(middle->index);
+			page = remotecache_request_page_lookup(request, index);
+			rc_debug("%s lookup page %lu for request req %lu",
+					__func__, index, request->id);
 
-			for (n = 0; n < nr_middle; ++n) {
-				pgoff_t index;
-				struct page *page;
-				middle = msg->middle.iov_base+sizeof(*middle)*n;
-				index = le64_to_cpu(middle->index);
-				page = remotecache_request_page_lookup(request, index);
-				rc_debug("%s lookup page %lu for request req %lu",
-						__func__, index, request->id);
-
-				if (!page) {
-					pr_err("%s: cannot find page index %lu in request %p",
-							__func__, index,
-							request);
-					BUG();
-				}
-
-				msg->pages[n] = page;
+			if (!page) {
+				pr_err("%s: cannot find page index %lu in request %p",
+						__func__, index,
+						request);
+				BUG();
 			}
+
+			msg->pages[n] = page;
 		}
 
 	}

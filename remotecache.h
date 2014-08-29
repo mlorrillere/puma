@@ -49,8 +49,6 @@ struct rc_get_request {
 	__le64 ino;		/* inode number from where the page comes from */
 } __packed;
 
-#define RC_MSG_FLAG_NOT_FOUND		(1 << RC_MSG_FLAGS_SHIFT)
-
 struct rc_get_response {
 	__le64 req_id;
 	__le32 pool_id;	/* identifier of the source filesystem */
@@ -84,6 +82,8 @@ struct rc_invalidate_ino_request {
 struct rc_invalidate_page_request {
 	__le32 pool_id;	/* identifier of the source filesystem */
 } __packed;
+
+#define RC_MSG_FLAG_INVALIDATE_PMD	(1 << RC_MSG_FLAGS_SHIFT)
 
 struct rc_invalidate_page_request_middle {
 	__le64 ino;	/* inode number from where the page comes from */
