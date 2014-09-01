@@ -171,7 +171,6 @@ bool do_invalidate_page(struct remotecache_session *session,
 	struct rc_msg *request = NULL;
 	struct rc_invalidate_page_request *inv;
 	struct rc_invalidate_page_request_middle *middle;
-	gfp_t gfp = metadata ? GFP_NOWAIT : GFP_KERNEL;
 
 	rc_debug("%s: invalidating page (%d,%lu,%lu)\n",
 			__func__, pool_id, ino, index);
@@ -217,7 +216,7 @@ bool do_invalidate_page(struct remotecache_session *session,
 	} else {
 new_request:
 		rc_con_flush_plug(&session->con, current);
-		request = rc_msgpool_get(&remotecache_inv_cachep, gfp,
+		request = rc_msgpool_get(&remotecache_inv_cachep, GFP_NOWAIT,
 				sizeof(*inv), sizeof(*middle)*64, 0);
 		if (!request)
 			return false;

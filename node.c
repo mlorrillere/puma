@@ -119,7 +119,7 @@ static int __init init_caches(void)
 			RC_MSG_TYPE_INVALIDATE_PAGE,
 			sizeof(struct rc_invalidate_page_request),
 			sizeof(struct rc_invalidate_page_request_middle)*64,
-			0, 64, "INVALIDATE_PAGE message pool");
+			0, 128, "INVALIDATE_PAGE message pool");
 	if (err != 0) {
 		pr_err("%s: failed to initialize INVALIDATE_PAGE message pool",
 				__func__);
