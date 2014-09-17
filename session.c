@@ -948,9 +948,6 @@ static void __remotecache_put_page(int pool_id, struct cleancache_filekey key,
 		return;
 	}
 
-	if (test_bit(REMOTECACHE_SESSION_SUSPENDED, &session->flags))
-		return;
-
 	if (!mutex_trylock(&session->c_lock)) {
 		rc_debug("%s node busy (session->c_lock locked)\n", __func__);
 		return;
@@ -974,6 +971,13 @@ static void __remotecache_put_page(int pool_id, struct cleancache_filekey key,
 	if (page_count(page) != 0 || !PageLocked(page) ||
 			page->mapping->host->i_ino < 2) {
 		WARN_ON(pmd);
+		spin_unlock_irqrestore(&metadata->lock, irq_flags);
+		goto out;
+	}
+
+	if (test_bit(REMOTECACHE_SESSION_SUSPENDED, &session->flags)) {
+		if (pmd)
+			__remotecache_metadata_remove(metadata, pmd);
 		spin_unlock_irqrestore(&metadata->lock, irq_flags);
 		goto out;
 	}
@@ -1024,6 +1028,8 @@ static void __remotecache_put_page(int pool_id, struct cleancache_filekey key,
 		if (!msg) {
 			pr_err("%s: cannot allocate put message\n",
 					__func__);
+			if (pmd)
+				__remotecache_metadata_remove(metadata, pmd);
 			spin_unlock_irqrestore(&metadata->lock, irq_flags);
 			/* TODO: remove pmd from metadata */
 			goto out;
@@ -1062,6 +1068,7 @@ static void __remotecache_put_page(int pool_id, struct cleancache_filekey key,
 				"ino %lu index %lu\n",
 				__func__, pmd, page, key.u.ino, index);
 		__remotecache_metadata_remove(metadata, pmd);
+		remotecache_page_metadata_put(pmd);
 		pmd = NULL;
 	}
 
