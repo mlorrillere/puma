@@ -551,6 +551,8 @@ repeat:
 	res->header.middle_len = cpu_to_le32(res->middle.iov_len);
 	rc_con_send(&session->con, res);
 
+	if (inode)
+		remotecache_inode_put(inode);
 	remotecache_put(cache);
 	rc_msg_put(msg);
 }
