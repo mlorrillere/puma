@@ -28,6 +28,14 @@
 #include "metadata.h"
 #include "msgpool.h"
 
+/*
+ * Module parameters
+ */
+bool remotecache_suspend_disable_get = false;
+
+module_param_named(suspend_disable_get, remotecache_suspend_disable_get,
+		bool, 0666);
+
 struct remotecache_session *remotecache_session_create(
 		struct remotecache_node *node)
 {
@@ -1791,6 +1799,13 @@ static int __request_add_page(struct page *page,
 		goto out;
 	}
 	spin_unlock_irqrestore(&metadata->lock, flags);
+
+	if (remotecache_suspend_disable_get &&
+			test_bit(REMOTECACHE_SESSION_SUSPENDED,
+				&request->session->flags)) {
+		pr_err("%s: node suspended\n", __func__);
+		goto abort;
+	}
 
 	/* XXX: Why should we abort if page has buffers ? */
 	/*if (page_has_buffers(page)) {

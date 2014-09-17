@@ -48,10 +48,18 @@ static int remotecache_node_releasepage(struct page *page);
 unsigned short remotecache_port = REMOTECACHE_PORT;
 ulong remotecache_max_size __read_mostly = 1<<19;
 bool remotecache_strategy __read_mostly = true;
+unsigned long remotecache_suspend_timeout = 3000;
+bool remotecache_suspend_inactive_is_low = true;
+bool remotecache_suspend_shadow = true;
 
 module_param_named(port, remotecache_port, ushort, 0444);
 module_param_named(store_size, remotecache_max_size, ulong, 0444);
 module_param_named(inclusive_strategy, remotecache_strategy, bool, 0444);
+module_param_named(suspend_timeout, remotecache_suspend_timeout, ulong, 0666);
+module_param_named(suspend_inactive_is_low,
+		remotecache_suspend_inactive_is_low, bool, 0444);
+module_param_named(suspend_shadow,
+		remotecache_suspend_shadow, bool, 0444);
 
 /*
  * caches/pools
@@ -191,6 +199,9 @@ static void remotecache_node_close(struct remotecache_node *node)
 	/* stop accepting new connections */
 	rc_con_close(&node->con);
 
+	/* cancel current timer */
+	del_timer_sync(&node->suspend_timer);
+
 	/* close and free remote nodes */
 	spin_lock_irqsave(&node->s_lock, flags);
 	list_splice_init(&node->sessions, &sessions);
@@ -264,19 +275,15 @@ static void remotecache_node_fault(struct rc_connection *con)
 /*
  * Suspend/resume logic
  */
-static void remotecache_node_suspend(struct remotecache_node *node)
+static void __do_node_suspend(struct remotecache_node *node)
 {
 	unsigned long flags;
 	struct remotecache_session *session;
 	struct rc_msg *msg;
 
-	if (test_bit(REMOTECACHE_NODE_CLOSED, &node->flags))
-		return;
-
+	spin_lock_irqsave(&node->s_lock, flags);
 	if (!test_and_set_bit(REMOTECACHE_NODE_SUSPENDED, &node->flags)) {
 		rc_debug("%s: suspend remote cache node\n", __func__);
-
-		spin_lock_irqsave(&node->s_lock, flags);
 		list_for_each_entry(session, &node->sessions, list) {
 			rc_debug("%s suspend session %s\n", __func__,
 					rc_pr_addr(&session->con.peer_addr));
@@ -289,26 +296,38 @@ static void remotecache_node_suspend(struct remotecache_node *node)
 					__func__);
 			}
 		}
-		spin_unlock_irqrestore(&node->s_lock, flags);
+	}
+	spin_unlock_irqrestore(&node->s_lock, flags);
+}
 
+static void remotecache_node_suspend(struct remotecache_node *node)
+{
+	if (test_bit(REMOTECACHE_NODE_CLOSED, &node->flags))
+		return;
+
+	mod_timer(&node->suspend_timer,
+			jiffies + remotecache_suspend_timeout*HZ/1000);
+
+	if (!test_bit(REMOTECACHE_NODE_SUSPENDED, &node->flags)) {
+		__do_node_suspend(node);
 	} else {
 		rc_debug("%s: server already suspended\n", __func__);
 	}
 }
 
-static void remotecache_node_resume(struct remotecache_node *node)
+static void __do_node_resume(struct remotecache_node *node)
 {
 	unsigned long flags;
 	struct remotecache_session *session;
 	struct rc_msg *msg;
 
+	spin_lock_irqsave(&node->s_lock, flags);
 	if (test_and_clear_bit(REMOTECACHE_NODE_SUSPENDED, &node->flags)) {
 		rc_debug("%s: resume remote cache node\n", __func__);
 
 		if (test_bit(REMOTECACHE_NODE_CLOSED, &node->flags))
-			return;
+			goto out;
 
-		spin_lock_irqsave(&node->s_lock, flags);
 		list_for_each_entry(session, &node->sessions, list) {
 			rc_debug("%s resume session %s\n", __func__,
 					rc_pr_addr(&session->con.peer_addr));
@@ -321,22 +340,49 @@ static void remotecache_node_resume(struct remotecache_node *node)
 						 __func__);
 			}
 		}
-		spin_unlock_irqrestore(&node->s_lock, flags);
+	}
+out:
+	spin_unlock_irqrestore(&node->s_lock, flags);
+}
+
+static void remotecache_node_resume(struct remotecache_node *node)
+{
+	if (test_bit(REMOTECACHE_NODE_SUSPENDED, &node->flags)) {
+		__do_node_resume(node);
 	} else {
 		pr_warn("%s: server already running\n", __func__);
 	}
 }
 
-static void remotecache_node_suspend_op(void)
+void remotecache_node_suspend_timeout(unsigned long data)
 {
-	if (this_node)
-		remotecache_node_suspend(this_node);
+	struct remotecache_node *node = (struct remotecache_node *) data;
+
+	rc_debug("%s node %p\n", __func__, node);
+	remotecache_node_resume(node);
+}
+
+static void remotecache_node_suspend_op(enum remotecache_suspend_mode mode)
+{
+	if (this_node) {
+		if ((mode == REMOTECACHE_SUSPEND_SHADOW &&
+				remotecache_suspend_shadow) ||
+				(mode == REMOTECACHE_SUSPEND_INACTIVE_IS_LOW &&
+				remotecache_suspend_inactive_is_low)) {
+			remotecache_node_suspend(this_node);
+		}
+	}
 }
 
 static void remotecache_node_resume_op(void)
 {
 	if (this_node)
 		remotecache_node_resume(this_node);
+}
+
+static bool remotecache_node_is_suspended_op(void)
+{
+	return test_bit(REMOTECACHE_NODE_SUSPENDED, &this_node->flags);
 }
 
 static int remotecache_node_suspend_param_set(const char *val, const struct kernel_param *kp)
@@ -383,7 +429,8 @@ static struct remotecache_ops remotecache_node_ops = {
 	.readpages = remotecache_node_readpages,
 	.ll_rw_block = remotecache_node_ll_rw_block,
 	.suspend = remotecache_node_suspend_op,
-	.resume = remotecache_node_resume_op
+	.resume = remotecache_node_resume_op,
+	.is_suspended = remotecache_node_is_suspended_op,
 };
 
 /*
@@ -643,6 +690,9 @@ static struct remotecache_node *create_node(void)
 	INIT_LIST_HEAD(&node->sessions);
 	spin_lock_init(&node->s_lock);
 	spin_lock_init(&node->m_lock);
+	init_timer(&node->suspend_timer);
+	node->suspend_timer.function = remotecache_node_suspend_timeout;
+	node->suspend_timer.data = (unsigned long) node;
 	node->flags = 0;
 
 	if ((err = init_node_network(node)) != 0)

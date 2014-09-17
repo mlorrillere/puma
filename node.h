@@ -13,6 +13,7 @@
 #include <linux/list.h>
 #include <linux/spinlock.h>
 #include <linux/uuid.h>
+#include <linux/timer.h>
 
 #include "messenger.h"
 #include "stats.h"
@@ -34,6 +35,8 @@ struct remotecache_node {
 	struct rc_connection con; 	/* Listen connection */
 	struct list_head sessions;
 	spinlock_t s_lock; 		/* lock to protect ->sessions */
+
+	struct timer_list suspend_timer;
 
 	unsigned long flags;
 };
