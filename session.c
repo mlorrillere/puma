@@ -1523,6 +1523,26 @@ static void __handle_get_response(struct remotecache_session *session,
 	this_node->stats.n_rc_hit += nr_middle;
 	this_node->stats.n_rc_miss += res->nr_miss;
 
+	/*
+	 * update metadata to remove missing pages
+	 */
+	if (res->nr_miss) {
+		spin_lock_irqsave(&metadata->lock, flags);
+		if (request->has_pages) {
+			int i;
+			for (i = 0; i < request->nr_pages; ++i) {
+				struct page *p = request->pages[i];
+				if (!PageUptodate(p))
+					__remotecache_metadata_erase(metadata,
+							ino, p->index);
+			}
+		} else {
+			if (!PageUptodate(request->page))
+				__remotecache_metadata_erase(metadata, ino,
+						request->page->index);
+		}
+		spin_unlock_irqrestore(&metadata->lock, flags);
+	}
 	remotecache_metadata_put(metadata);
 
 	/*
