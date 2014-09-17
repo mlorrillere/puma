@@ -282,11 +282,6 @@ static void __handle_put(struct remotecache_session *session, struct rc_msg *msg
 
 	BUG_ON(msg->front.iov_len != sizeof(*request));
 
-	if (test_bit(REMOTECACHE_NODE_SUSPENDED, &session->node->flags)) {
-		pr_err("%s: node suspended\n", __func__);
-		goto out;
-	}
-
 	for ( ; middle < endp; middle++, pageidx++) {
 		struct remotecache_inode *inode;
 		int error;
@@ -305,6 +300,10 @@ static void __handle_put(struct remotecache_session *session, struct rc_msg *msg
 		rcu_read_unlock();
 
 		if (!inode) {
+			if (test_bit(REMOTECACHE_NODE_SUSPENDED,
+						&session->node->flags))
+				continue;
+
 			rc_debug("%s: create inode %d %lu\n", __func__,
 					le32_to_cpu(request->pool_id), ino);
 
@@ -325,6 +324,25 @@ static void __handle_put(struct remotecache_session *session, struct rc_msg *msg
 					inode->ino);
 		}
 
+		/*
+		 * If the node is suspended, we remove the page to avoid
+		 * inconsistencies because client metadata might be out of
+		 * date.
+		 */
+		if (test_bit(REMOTECACHE_NODE_SUSPENDED, &session->node->flags)) {
+			struct page *p;
+
+			spin_lock(&inode->lock);
+			p = radix_tree_delete(&inode->pages_tree, index);
+			if (p) {
+				BUG_ON(!get_page_unless_zero(p));
+				remotecache_page_release(p);
+				put_page(p);
+			}
+			spin_unlock(&inode->lock);
+			remotecache_inode_put(inode);
+			continue;
+		}
 		/*
 		 * Insert/replace the old page with the new one
 		 */
@@ -368,21 +386,7 @@ static void __handle_put(struct remotecache_session *session, struct rc_msg *msg
 				 */
 				if (old) {
 					BUG_ON(!get_page_unless_zero(old));
-					if (TestClearPageRemote(old)) {
-						ClearPagePrivate(old);
-						set_page_private(old, 0);
-						__dec_zone_page_state(old, NR_FILE_PAGES);
-
-						/*
-						 * Release page cache ref
-						 */
-						page_cache_release(old);
-						atomic_dec(&cache->size);
-					}
-
-					/*
-					 * Drop last ref
-					 */
+					remotecache_page_release(old);
 					put_page(old);
 				}
 			}
@@ -407,7 +411,6 @@ static void __handle_put(struct remotecache_session *session, struct rc_msg *msg
 		//shrink_cache(cache, session, msg->nr_pages*8);
 	}
 
-out:
 	remotecache_put(cache);
 	rc_msg_put(msg);
 }
@@ -531,13 +534,7 @@ repeat:
 				struct page *p = pages[i];
 				if (!p)
 					continue;
-				if (TestClearPageRemote(p)) {
-					ClearPagePrivate(p);
-					set_page_private(p, 0);
-					__dec_zone_page_state(p, NR_FILE_PAGES);
-					page_cache_release(p);
-					atomic_dec(&cache->size);
-				}
+				remotecache_page_release(p);
 				put_page(p);
 			}
 		}
@@ -661,25 +658,11 @@ static void __invalidate_page(struct remotecache_session *session,
 				struct page *p = pages[i];
 				if (!p)
 					break;
-				if (TestClearPageRemote(p)) {
-					ClearPagePrivate(p);
-					set_page_private(p, 0);
-					__dec_zone_page_state(p, NR_FILE_PAGES);
-
-					/*
-					 * Release page cache ref
-					 */
-					page_cache_release(p);
-				}
-
-				/*
-				 * Drop last ref
-				 */
+				remotecache_page_release(p);
 				put_page(p);
 			}
 
 			n -= batch;
-			atomic_sub(batch, &cache->size);
 			cond_resched();
 		} while (n > 0);
 

@@ -139,6 +139,27 @@ void remotecache_inode_release(struct kref *ref)
 	kmem_cache_free(remotecache_inode_cachep, inode);
 }
 
+/*
+ * Remove a remote cache page from system LRU.
+ * Caller should have a ref on p.
+ */
+void remotecache_page_release(struct page *p) {
+	struct remotecache_inode *inode = (void*)p->private;
+	struct remotecache *cache = inode->cache;
+
+	if (TestClearPageRemote(p)) {
+		ClearPagePrivate(p);
+		set_page_private(p, 0);
+		__dec_zone_page_state(p, NR_FILE_PAGES);
+
+		/*
+		 * Release page cache ref
+		 */
+		page_cache_release(p);
+		atomic_dec(&cache->size);
+	}
+}
+
 void remotecache_clear(struct remotecache *cache)
 {
 	int bucket;

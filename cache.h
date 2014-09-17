@@ -84,4 +84,6 @@ void __remotecache_remove_inode(struct remotecache_inode *i);
 
 struct remotecache_inode *__remotecache_lookup_inode(
 		struct remotecache *, ino_t);
+
+void remotecache_page_release(struct page *p);
 #endif /* REMOTECACHE_CACHE_H */
