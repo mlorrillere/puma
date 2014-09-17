@@ -186,6 +186,8 @@ static void remotecache_node_close(struct remotecache_node *node)
 
 	pr_err("%s close node %p\n", __func__, node);
 
+	BUG_ON(test_and_set_bit(REMOTECACHE_NODE_CLOSED, &node->flags));
+
 	/* stop accepting new connections */
 	rc_con_close(&node->con);
 
@@ -268,6 +270,9 @@ static void remotecache_node_suspend(struct remotecache_node *node)
 	struct remotecache_session *session;
 	struct rc_msg *msg;
 
+	if (test_bit(REMOTECACHE_NODE_CLOSED, &node->flags))
+		return;
+
 	if (!test_and_set_bit(REMOTECACHE_NODE_SUSPENDED, &node->flags)) {
 		rc_debug("%s: suspend remote cache node\n", __func__);
 
@@ -285,8 +290,9 @@ static void remotecache_node_suspend(struct remotecache_node *node)
 			}
 		}
 		spin_unlock_irqrestore(&node->s_lock, flags);
+
 	} else {
-		pr_warn("%s: server already suspended\n", __func__);
+		rc_debug("%s: server already suspended\n", __func__);
 	}
 }
 
@@ -298,6 +304,9 @@ static void remotecache_node_resume(struct remotecache_node *node)
 
 	if (test_and_clear_bit(REMOTECACHE_NODE_SUSPENDED, &node->flags)) {
 		rc_debug("%s: resume remote cache node\n", __func__);
+
+		if (test_bit(REMOTECACHE_NODE_CLOSED, &node->flags))
+			return;
 
 		spin_lock_irqsave(&node->s_lock, flags);
 		list_for_each_entry(session, &node->sessions, list) {

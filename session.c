@@ -842,10 +842,18 @@ out:
 
 static void remotecache_session_fault(struct rc_connection *con)
 {
+	unsigned long flags;
 	struct remotecache_session *session = container_of(con,
 			struct remotecache_session, con);
 
 	pr_err("%s received fault %s", __func__, con->error_msg);
+
+	/* close and free session */
+	spin_lock_irqsave(&session->node->s_lock, flags);
+	list_del_init(&session->list);
+	spin_unlock_irqrestore(&session->node->s_lock, flags);
+
+	remotecache_session_put(session);
 }
 
 /*
@@ -1986,7 +1994,7 @@ int remotecache_node_readpage(struct file *file, struct page *page)
 
 	session = remotecache_node_session(this_node);
 	if (!session) {
-		pr_err("%s: not connected to a remote node\n", __func__);
+		rc_debug("%s: not connected to a remote node\n", __func__);
 		goto readpage;
 	}
 
@@ -2032,7 +2040,7 @@ void remotecache_node_ll_rw_block(int rw, struct buffer_head *bh)
 
 	session = remotecache_node_session(this_node);
 	if (!session) {
-		pr_err("%s: not connected to a remote node\n", __func__);
+		rc_debug("%s: not connected to a remote node\n", __func__);
 		goto submit;
 	}
 
@@ -2082,7 +2090,7 @@ int remotecache_node_readpages(struct file *file,
 
 	session = remotecache_node_session(this_node);
 	if (!session) {
-		pr_err("%s: not connected to a remote node\n", __func__);
+		rc_debug("%s: not connected to a remote node\n", __func__);
 		goto readpages;
 	}
 

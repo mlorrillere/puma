@@ -39,7 +39,8 @@ struct remotecache_node {
 };
 
 enum remotecache_node_flags {
-	REMOTECACHE_NODE_SUSPENDED
+	REMOTECACHE_NODE_SUSPENDED,
+	REMOTECACHE_NODE_CLOSED
 };
 
 extern struct remotecache_node *this_node;
