@@ -431,8 +431,6 @@ static void __handle_get(struct remotecache_session *session, struct rc_msg *msg
 				     *endp;
 	struct rc_get_response *front;
 	struct rc_get_response_middle *rmid;
-	unsigned nr_pages =
-		msg->middle.iov_len/sizeof(struct rc_get_response_middle);
 	struct remotecache *cache;
 	struct remotecache_inode *inode;
 
@@ -440,7 +438,6 @@ static void __handle_get(struct remotecache_session *session, struct rc_msg *msg
 	ino_t ino = (ino_t)le64_to_cpu(request->ino);
 
 	BUG_ON(msg->front.iov_len != sizeof(*request));
-	BUG_ON(nr_pages == 0);
 
 	cache = session_get_cache(session, le32_to_cpu(request->pool_id),
 			NULL_UUID_LE);
@@ -512,9 +509,6 @@ repeat:
 			rmid->index = cpu_to_le64(p->index);
 			rc_msg_add_page(res, p);
 
-			if (remotecache_strategy != RC_STRATEGY_EXCLUSIVE) {
-				mark_page_accessed(p);
-			}
 			rc_debug("%s page %p pool %d ino %lu index %lu " \
 					"res %p middle %p\n",
 					__func__, p, pool_id, ino,
@@ -522,7 +516,10 @@ repeat:
 			front->nr_miss--;
 			rmid++;
 
-			put_page(p);
+			if (remotecache_strategy != RC_STRATEGY_EXCLUSIVE) {
+				mark_page_accessed(p);
+				put_page(p);
+			}
 		}
 
 		/*
@@ -532,16 +529,14 @@ repeat:
 		if (remotecache_strategy == RC_STRATEGY_EXCLUSIVE) {
 			spin_lock(&inode->lock);
 			for (i = 0; i < n; ++i) {
-				pages[i] = radix_tree_delete(&inode->pages_tree, index+i);
-				if (pages[i])
-					get_page(pages[i]);
+				struct page *p = pages[i];
+				radix_tree_delete_item(&inode->pages_tree,
+						p->index, p);
 			}
 			spin_unlock(&inode->lock);
 
 			for (i = 0; i < n; ++i) {
 				struct page *p = pages[i];
-				if (!p)
-					continue;
 				remotecache_page_release(p);
 				put_page(p);
 			}
@@ -1960,7 +1955,7 @@ static void __send_request(struct remotecache_session *session,
 		BUG_ON(!msg);
 
 		msg->private = request;
-		msg->middle.iov_len = nr_to_send*sizeof(struct rc_get_request_middle);
+		msg->middle.iov_len = sizeof(struct rc_get_request_middle);
 		msg->header.middle_len = cpu_to_le32(msg->middle.iov_len);
 
 		req = msg->front.iov_base;
@@ -1974,23 +1969,23 @@ static void __send_request(struct remotecache_session *session,
 		 * Add first page to the middle
 		 */
 		if (request->has_pages)
-			middle->index =	request->pages[0]->index;
+			middle->index =	cpu_to_le64(request->pages[sent]->index);
 		else
-			middle->index = request->page->index;
+			middle->index = cpu_to_le64(request->page->index);
 		middle->nr_pages = 1;
 
 		/*
 		 * Increment middle->nr_pages until a hole is found
 		 */
 		for (i = 1; i < nr_to_send; ++i) {
-			struct page *page = request->pages[i];
-			if (page->index == (middle->index + middle->nr_pages)) {
+			struct page *page = request->pages[i + sent];
+			if (page->index == (le64_to_cpu(middle->index) + middle->nr_pages)) {
 				middle->nr_pages++;
-				msg->middle.iov_len -= sizeof(*middle);
 			} else {
-				middle->index = cpu_to_le64(middle->index);
-				middle++;
-				middle->index = page->index;
+				middle = msg->middle.iov_base +
+					msg->middle.iov_len;
+				msg->middle.iov_len += sizeof(struct rc_get_request_middle);
+				middle->index = cpu_to_le64(page->index);
 				middle->nr_pages = 1;
 			}
 		}
