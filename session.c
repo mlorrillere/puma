@@ -16,6 +16,7 @@
 #include <linux/sort.h>
 #include <linux/remotecache.h>
 #include <linux/cleancache.h>
+#include <linux/wait.h>
 
 #ifdef CONFIG_REMOTECACHE_DEBUG
 #include <linux/crc32c.h>
@@ -1354,6 +1355,7 @@ static struct remotecache_request *remotecache_request_create(
 	request->nr_pages = 0;
 	request->session = session;
 	request->bh = NULL;
+	request->sync = false;
 
 	return request;
 }
@@ -1444,6 +1446,8 @@ static void remotecache_request_put(struct remotecache_request *r)
 {
 	kref_put(&r->kref, __remotecache_request_last_put);
 }
+
+DECLARE_WAIT_QUEUE_HEAD(wait_readpage_sync);
 
 static void __handle_get_response(struct remotecache_session *session,
 		struct rc_msg *msg)
@@ -1544,8 +1548,14 @@ static void __handle_get_response(struct remotecache_session *session,
 		} else if (request->bh) {
 			rc_debug("%s calling b_end_io(%p, %d)\n", __func__,
 				request->bh, PageUptodate(request->page));
+			pr_err("%s req %lu bh %p page %p ino %lu index %lu\n",
+				__func__, request->id, request->bh,
+				request->bh->b_page, ino,
+				request->bh->b_page->index);
 			request->bh->b_end_io(request->bh,
 				PageUptodate(request->page));
+		} else if (request->sync) {
+			wake_up(&wait_readpage_sync);
 		} else {
 			unlock_page(request->page);
 		}
@@ -2000,6 +2010,56 @@ static void __send_request(struct remotecache_session *session,
 	this_node->stats.nget += sent;
 }
 
+void remotecache_node_readpage_sync(struct file *file, struct page *page)
+{
+	struct remotecache_request *request;
+	struct remotecache_session *session;
+
+	rc_debug("%s file %s index %lu", __func__,
+			file ? file->f_dentry->d_name.name : NULL,
+			page->index);
+
+	if (!cleancache_fs_enabled(page)) {
+		rc_debug("%s: cleancache disabled", __func__);
+		return;
+	}
+
+	session = remotecache_node_session(this_node);
+	if (!session) {
+		rc_debug("%s: not connected to a remote node\n", __func__);
+		return;
+	}
+
+	request = remotecache_request_create(session, 0);
+	if (!request) {
+		pr_err("Can't allocate request");
+		return;
+	}
+
+	request->sync = true;
+
+	if (__request_add_page(page, page->mapping, request)) {
+		mutex_lock(&session->r_lock);
+		list_add_tail(&request->list, &session->requests);
+		mutex_unlock(&session->r_lock);
+
+		if (request->page) {
+			__send_request(session, request, page->mapping);
+
+			while (!atomic_read(&request->nr_received)) {
+				DEFINE_WAIT(wait);
+
+				prepare_to_wait(&wait_readpage_sync, &wait,
+						TASK_UNINTERRUPTIBLE);
+				if (!atomic_read(&request->nr_received))
+					schedule();
+				finish_wait(&wait_readpage_sync, &wait);
+			}
+		}
+	}
+	remotecache_request_put(request);
+}
+
 int remotecache_node_readpage(struct file *file, struct page *page)
 {
 	struct remotecache_request *request;
@@ -2047,49 +2107,16 @@ readpage:
 
 void remotecache_node_ll_rw_block(int rw, struct buffer_head *bh)
 {
-	struct remotecache_request *request;
-	struct remotecache_session *session;
 	struct address_space *mapping = bh->b_page->mapping;
 
 	rc_debug("%s bh %p page %p ino %lu index %lu\n", __func__,
 			bh, bh->b_page, mapping->host->i_ino,
 			bh->b_page->index);
 
-	if (!cleancache_fs_enabled(bh->b_page)) {
-		rc_debug("%s: cleancache disabled", __func__);
-		goto submit;
+	if (cleancache_fs_enabled(bh->b_page)) {
+		cleancache_invalidate_page(mapping, bh->b_page);
 	}
 
-	session = remotecache_node_session(this_node);
-	if (!session) {
-		rc_debug("%s: not connected to a remote node\n", __func__);
-		goto submit;
-	}
-
-	request = remotecache_request_create(session, 0);
-	if (!request) {
-		pr_err("Can't allocate request");
-		goto submit;
-	}
-
-	if (__request_add_page(bh->b_page, mapping, request)) {
-		mutex_lock(&session->r_lock);
-		list_add_tail(&request->list, &session->requests);
-		mutex_unlock(&session->r_lock);
-
-		if (request->page) {
-			request->bh = bh;
-			__send_request(session, request, mapping);
-		}
-		remotecache_request_put(request);
-	} else {
-		remotecache_request_put(request);
-		goto submit;
-	}
-
-	return;
-
-submit:
 	submit_bh(rw, bh);
 }
 

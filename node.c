@@ -426,6 +426,7 @@ static struct remotecache_ops remotecache_node_ops = {
 	.flush_plug = remotecache_node_flush_plug,
 	.releasepage = remotecache_node_releasepage,
 	.readpage = remotecache_node_readpage,
+	.readpage_sync = remotecache_node_readpage_sync,
 	.readpages = remotecache_node_readpages,
 	.ll_rw_block = remotecache_node_ll_rw_block,
 	.suspend = remotecache_node_suspend_op,

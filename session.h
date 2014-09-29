@@ -66,6 +66,7 @@ struct remotecache_request {
 	unsigned nr_pages;	/* Number of pages */
 	atomic_t nr_received;	/* Number of pages already handled */
 	bool has_pages;		/* use of ->page or ->pages ? */
+	bool sync;
 };
 
 extern struct rc_connection_operations session_ops;

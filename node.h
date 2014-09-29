@@ -80,5 +80,6 @@ int remotecache_node_readpages(struct file *file,
 		struct address_space *mapping, struct list_head *pages,
 		unsigned nr_pages);
 int remotecache_node_readpage(struct file *file, struct page *page);
+void remotecache_node_readpage_sync(struct file *file, struct page *page);
 void remotecache_node_ll_rw_block(int rw, struct buffer_head *bh);
 #endif //NODE_H
