@@ -527,6 +527,7 @@ static int remotecache_node_releasepage(struct page *page) {
 	WARN_ON(!TestClearPageRemote(page));
 	ClearPagePrivate(page);
 	set_page_private(page, 0);
+	__dec_zone_page_state(page, NR_REMOTE);
 	__dec_zone_page_state(page, NR_FILE_PAGES);
 	atomic_dec(&cache->size);
 

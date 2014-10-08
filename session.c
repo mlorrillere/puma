@@ -371,6 +371,7 @@ static void __handle_put(struct remotecache_session *session, struct rc_msg *msg
 			set_page_private(new, (unsigned long)inode);
 
 			__inc_zone_page_state(new, NR_FILE_PAGES);
+			__inc_zone_page_state(new, NR_REMOTE);
 			lru_cache_add_file(new);
 			atomic_inc(&cache->size);
 
@@ -1170,7 +1171,6 @@ kmap_failure:
 		 * page_count
 		 */
 		SetPageRemote(page);
-		inc_zone_page_state(page, NR_REMOTE);
 		page_unfreeze_refs(page, 2);
 
 		rc_msg_add_page(msg, page);
@@ -1646,7 +1646,6 @@ static void __handle_put_ack(struct remotecache_session *session, struct rc_msg 
 
 		put_page(page);
 		if (PageRemote(page)) {
-			dec_zone_page_state(page, NR_REMOTE);
 			unlock_page(page);
 		} else {
 			mempool_free(page, remotecache_page_pool);

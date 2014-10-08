@@ -119,6 +119,7 @@ void remotecache_inode_release(struct kref *ref)
 			if (TestClearPageRemote(p)) {
 				ClearPagePrivate(p);
 				set_page_private(p, 0);
+				__dec_zone_page_state(p, NR_REMOTE);
 				__dec_zone_page_state(p, NR_FILE_PAGES);
 
 				/*
@@ -150,6 +151,7 @@ void remotecache_page_release(struct page *p) {
 	if (TestClearPageRemote(p)) {
 		ClearPagePrivate(p);
 		set_page_private(p, 0);
+		__dec_zone_page_state(p, NR_REMOTE);
 		__dec_zone_page_state(p, NR_FILE_PAGES);
 
 		/*
