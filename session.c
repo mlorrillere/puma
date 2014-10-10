@@ -169,6 +169,25 @@ static struct remotecache *session_get_cache(
 }
 
 /*
+ * match function against pool_id for do_invalidate_page
+ */
+bool match_pool_id(struct rc_msg *m, void *arg)
+{
+	int pool_id = *(int *)arg;
+	struct rc_invalidate_page_request *front;
+
+	if (le16_to_cpu(m->header.type) != RC_MSG_TYPE_INVALIDATE_PAGE)
+		return false;
+
+	front = m->front.iov_base;
+
+	if (le32_to_cpu(front->pool_id) == pool_id)
+		return true;
+
+	return false;
+}
+
+/*
  * Dispatch functions
  *
  * If metadata is true, then we want to invalidate peer's metadata? Otherwise
@@ -178,30 +197,22 @@ bool do_invalidate_page(struct remotecache_session *session,
 		int pool_id, ino_t ino, pgoff_t index, bool metadata)
 {
 	struct rc_msg *request = NULL;
-	struct rc_invalidate_page_request *inv;
+	struct rc_invalidate_page_request *front;
 	struct rc_invalidate_page_request_middle *middle;
 
 	rc_debug("%s: invalidating page (%d,%lu,%lu)\n",
 			__func__, pool_id, ino, index);
 
-	request = rc_con_plug_last();
+	request = rc_con_plug_find(match_pool_id, &pool_id);
 	if (!request)
-		goto new_request;
-
-	if (le16_to_cpu(request->header.type) != RC_MSG_TYPE_INVALIDATE_PAGE)
 		goto new_request;
 
 	if (metadata && !rc_msg_test_flag(request, RC_MSG_FLAG_INVALIDATE_PMD))
 		goto new_request;
 
-	inv = request->front.iov_base;
-	if (cpu_to_le32(pool_id) != inv->pool_id)
-		goto new_request;
-
 	/* We try to merge invalidate request with the previous entry of
 	 * the last message */
-	middle =
-		request->middle.iov_base+request->middle.iov_len-sizeof(*middle);
+	middle = request->middle.iov_base+request->middle.iov_len-sizeof(*middle);
 
 	if (le64_to_cpu(middle->ino) == ino &&
 			le64_to_cpu(middle->index) == index + 1 &&
@@ -224,14 +235,13 @@ bool do_invalidate_page(struct remotecache_session *session,
 		request->header.middle_len = cpu_to_le32(request->middle.iov_len);
 	} else {
 new_request:
-		rc_con_flush_plug(&session->con, current);
 		request = rc_msgpool_get(&remotecache_inv_cachep, GFP_NOWAIT,
-				sizeof(*inv), sizeof(*middle)*64, 0);
+				sizeof(*front), sizeof(*middle)*64, 0);
 		if (!request)
 			return false;
 
-		inv = request->front.iov_base;
-		inv->pool_id	= cpu_to_le32(pool_id);
+		front = request->front.iov_base;
+		front->pool_id	= cpu_to_le32(pool_id);
 
 		request->middle.iov_len = sizeof(*middle);
 		request->header.middle_len = cpu_to_le32(request->middle.iov_len);
@@ -779,7 +789,6 @@ struct rc_msg * remotecache_session_alloc_msg(struct rc_connection *con,
 	int front_len = le32_to_cpu(header->front_len);
 	int middle_len = le32_to_cpu(header->middle_len);
 	int nr_pages = le32_to_cpu(header->data_len)/PAGE_SIZE;
-	int i;
 	struct rc_msg *msg = NULL;
 
 	switch (le16_to_cpu(header->type)) {
@@ -794,20 +803,6 @@ struct rc_msg * remotecache_session_alloc_msg(struct rc_connection *con,
 	case RC_MSG_TYPE_PUT:
 		msg = rc_msgpool_get(&remotecache_put_cachep, GFP_NOFS,
 				front_len, middle_len, nr_pages);
-		BUG_ON(!msg);
-		for (i = 0; i < nr_pages; ++i) {
-			msg->pages[i] =
-				mempool_alloc(remotecache_page_pool, GFP_NOFS);
-			BUG_ON(!msg->pages[i]);
-			if (!msg->pages[i]) {
-				for (; i > 0; --i) {
-					mempool_free(msg->pages[i], remotecache_page_pool);
-				}
-				rc_msg_put(msg);
-				msg = NULL;
-				goto out;
-			}
-		}
 		break;
 	case RC_MSG_TYPE_GET:
 		msg = rc_msgpool_get(&remotecache_get_cachep, GFP_NOFS,
@@ -826,7 +821,6 @@ struct rc_msg * remotecache_session_alloc_msg(struct rc_connection *con,
 		break;
 	}
 
-out:
 	return msg;
 }
 
@@ -1222,7 +1216,7 @@ static void __remotecache_invalidate_page(int pool_id, struct cleancache_filekey
 	 */
 	if (erased) {
 		if (!do_invalidate_page(session, pool_id, key.u.ino, index, false))
-			pr_warn("%s: cannot invalidate page: out of memory", __func__);
+			pr_warn("%s: cannot invalidate page: out of memory\n", __func__);
 
 		this_node->stats.n_invalidate_pages++;
 	}
@@ -1774,6 +1768,17 @@ static void remotecache_session_alloc_data(struct rc_connection *con, struct rc_
 			msg->pages[n] = page;
 		}
 
+	} else if (le16_to_cpu(msg->header.type == RC_MSG_TYPE_PUT)) {
+		int nr_pages = le32_to_cpu(msg->header.data_len)/PAGE_SIZE;
+		int i;
+		for (i = 0; i < nr_pages; ++i) {
+			msg->pages[i] =	alloc_page(GFP_KERNEL);
+			if (!msg->pages[i]) {
+				for (; i > 0; --i)
+					__free_page(msg->pages[i]);
+				return;
+			}
+		}
 	}
 }
 

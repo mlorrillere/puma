@@ -1938,6 +1938,21 @@ out:
 }
 EXPORT_SYMBOL(rc_con_plug_last);
 
+struct rc_msg *rc_con_plug_find(bool (*match) (struct rc_msg *, void *), void *arg)
+{
+	struct rc_msg *m;
+
+	if (!current->remotecache_plug)
+		goto out;
+
+	list_for_each_entry(m, &current->remotecache_plug->list, list_head)
+		if (match(m, arg))
+			return m;
+
+out:
+	return NULL;
+}
+
 void rc_msg_add_page(struct rc_msg *msg, struct page *page)
 {
 	unsigned data_len = le32_to_cpu(msg->header.data_len);

@@ -228,6 +228,8 @@ static inline void rc_msg_get(struct rc_msg *msg)
 }
 
 extern void rc_msg_last_put(struct kref *kref);
+extern struct rc_msg *rc_con_plug_find(
+		bool (*match) (struct rc_msg *, void *), void *);
 static inline void rc_msg_put(struct rc_msg *msg)
 {
 	kref_put(&msg->kref, rc_msg_last_put);
