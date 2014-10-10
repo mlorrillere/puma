@@ -572,6 +572,9 @@ static int rc_tcp_recvmsg(struct socket *sock, void *buf, size_t len)
 	r = __rc_tcp_recvmsg(sock, buf, len);
 	unlock_sock_fast(sock->sk, fast);
 
+	if (r == -EAGAIN)
+		r = 0;
+
 	return r;
 }
 
