@@ -85,6 +85,8 @@
 #define CON_FLAG_WRITE_PENDING	   1  /* we have data ready to send */
 #define CON_FLAG_SOCK_CLOSED	   2  /* socket state changed to closed */
 #define CON_FLAG_URG	   3          /* we received or sent an urgent message */
+#define CON_FLAG_APP_LIMITED       4  /* we are limited by the application
+					 window size */
 
 
 /* static tag bytes (protocol control messages) */
@@ -339,6 +341,12 @@ static void rc_sock_write_space(struct sock *sk)
 		/* A newly created socked might not be fully initialized */
 		rc_debug("%s socked %p not fully initialized", __func__, sk);
 		return;
+	}
+
+	if (test_and_clear_bit(CON_FLAG_APP_LIMITED, &con->flags)) {
+		rc_debug("%s clear SOCK_ASYNC_NOSPACE\n", __func__);
+		con->sock->sk->sk_write_pending--;
+		clear_bit(SOCK_ASYNC_NOSPACE, &con->sock->flags);
 	}
 
 	/* only queue to workqueue if there is data we want to write,
@@ -790,7 +798,7 @@ int rc_con_listen(struct rc_connection *con, struct sockaddr *addr)
 			       IPPROTO_TCP, &sock);
 	if (ret)
 		return ret;
-	sock->sk->sk_allocation = GFP_NOWAIT;
+	sock->sk->sk_allocation = GFP_ATOMIC;
 
 	ret = kernel_setsockopt(sock, SOL_SOCKET, SO_REUSEADDR,
 			(char*)&reuseaddr, sizeof(reuseaddr));
@@ -1554,23 +1562,14 @@ more_kvec:
 	rc_debug("try_write nothing else to write.\n");
 	ret = 0;
 out:
-	/* There is a path in TCP where there is not enough space to allocate
-	 * memory __and__ it cannot recover memory from its already allocated
-	 * objects (sk_buf, ...) __and__ we never get notified through
-	 * sock_write_space: the only way I found is to requeue the connection
-	 * to the workqueue whenever we see SOCK_ASYNC_NOSPACE bit set into
-	 * the socket.
-	 */
-	if (test_bit(CON_FLAG_WRITE_PENDING, &con->flags) &&
-			test_bit(SOCK_ASYNC_NOSPACE, &con->sock->flags)) {
-		rc_debug("%s SOCK_ASYNC_NOSPACE set, requeuing with "
-				"backoff=%lu\n", __func__, con->backoff);
-		con->ops->get(con);
-		if (mod_delayed_work(rc_msgr_wq, &con->work, con->backoff))
-			con->ops->put(con);
-		con->backoff = min_t(unsigned long, con->backoff*2, HZ);
-	} else {
-		con->backoff = 1;
+	if (test_bit(SOCK_ASYNC_NOSPACE, &con->sock->flags) &&
+			!test_and_set_bit(CON_FLAG_APP_LIMITED, &con->flags)) {
+		rc_debug("%s SOCK_ASYNC_NOSPACE set\n", __func__);
+		/* Notify TCP that we're limited by the
+		 * application window size.
+		 */
+		set_bit(SOCK_NOSPACE, &con->sock->flags);
+		con->sock->sk->sk_write_pending++;
 	}
 
 	if (test_and_clear_bit(CON_FLAG_URG, &con->flags)) {
