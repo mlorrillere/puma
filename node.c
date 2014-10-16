@@ -51,6 +51,7 @@ bool remotecache_strategy __read_mostly = true;
 unsigned long remotecache_suspend_timeout = 3000;
 bool remotecache_suspend_inactive_is_low = true;
 bool remotecache_suspend_shadow = true;
+size_t remotecache_mempool_size = 1024;
 
 module_param_named(port, remotecache_port, ushort, 0444);
 module_param_named(store_size, remotecache_max_size, ulong, 0444);
@@ -140,7 +141,9 @@ static int __init init_caches(void)
 	 * Note that we cannot mempool_create_page_pool as explained in
 	 * comment of __page_pool_alloc.
 	 */
-	remotecache_page_pool = mempool_create(PAGES_PER_PUT*32,
+	pr_info("%s: initializing memory pool with %lu pages\n", __func__,
+			remotecache_mempool_size);
+	remotecache_page_pool = mempool_create(remotecache_mempool_size,
 			__page_pool_alloc, __page_pool_free, NULL);
 	if (!remotecache_page_pool) {
 		pr_err("%s: failed to initialize pages pool", __func__);
@@ -169,7 +172,42 @@ static void destroy_caches(void)
 	mempool_destroy(remotecache_page_pool);
 }
 
+static int remotecache_mempool_size_set(const char *val, const struct kernel_param *kp)
+{
+	size_t mem_size;
 
+	if (!val)
+		return -EINVAL;
+
+	mem_size = memparse(val, NULL);
+
+	if (mem_size == 0)
+		return -EINVAL;
+
+	if ((mem_size / PAGE_SIZE) * PAGE_SIZE != mem_size)
+		return -EINVAL;
+
+	remotecache_mempool_size = mem_size / PAGE_SIZE;
+	if (this_node)
+		mempool_resize(remotecache_page_pool,
+				remotecache_mempool_size,
+				GFP_KERNEL);
+
+	return 0;
+}
+
+static int remotecache_mempool_size_get(char *buffer, const struct kernel_param *kp)
+{
+	return sprintf(buffer, "%lu",  remotecache_mempool_size * PAGE_SIZE);
+}
+
+
+struct kernel_param_ops remotecache_mempool_size_ops = {
+	.set = remotecache_mempool_size_set,
+	.get = remotecache_mempool_size_get
+};
+
+module_param_cb(mempool_size, &remotecache_mempool_size_ops, NULL, 0644);
 
 void remotecache_node_last_put(struct kref *ref)
 {
