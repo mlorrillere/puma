@@ -53,6 +53,15 @@ struct rc_stats {
 	/* Miss avoided using the remote_bitmap bitmap */
 	unsigned long n_rc_miss_avoided;
 
+	/* Number of put using memory pool */
+	unsigned long n_fast_put;
+
+	/* Number of slow put (without the use of the memory pool) */
+	unsigned long n_slow_put;
+
+	/* Number of aborted put due to empty memory pool */
+	unsigned long n_aborted_put;
+
 	/* Time needed for a RC_MSG_GET to complete */
 	struct timespec send_max_time;
 	struct timespec send_min_time;

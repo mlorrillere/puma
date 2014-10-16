@@ -33,9 +33,11 @@
  * Module parameters
  */
 bool remotecache_suspend_disable_get = false;
+bool remotecache_slow_put = false;
 
 module_param_named(suspend_disable_get, remotecache_suspend_disable_get,
 		bool, 0666);
+module_param_named(enable_slow_put, remotecache_slow_put, bool, 0666);
 
 struct remotecache_session *remotecache_session_create(
 		struct remotecache_node *node)
@@ -910,7 +912,7 @@ static void __remotecache_put_page(int pool_id, struct cleancache_filekey key,
 	struct rc_msg *msg;
 	struct rc_put_request *p;
 	struct rc_put_request_middle *middle;
-	struct page *dst_page;
+	struct page *dst_page = NULL;
 	short type;
 	struct remotecache_metadata *metadata;
 	struct remotecache *cache;
@@ -1002,6 +1004,17 @@ static void __remotecache_put_page(int pool_id, struct cleancache_filekey key,
 			 */
 			break;
 		}
+	}
+
+	dst_page = mempool_alloc(remotecache_page_pool, GFP_NOWAIT);
+	if (dst_page) {
+		get_page(dst_page);
+	} else if (!remotecache_slow_put) {
+		if (pmd)
+			__remotecache_metadata_remove(metadata, pmd);
+		spin_unlock_irqrestore(&metadata->lock, irq_flags);
+		this_node->stats.n_aborted_put++;
+		goto out;
 	}
 
 	msg = rc_con_plug_last();
@@ -1096,27 +1109,6 @@ static void __remotecache_put_page(int pool_id, struct cleancache_filekey key,
 	spin_unlock_irqrestore(&metadata->lock, irq_flags);
 
 	/*
-	 * We keep a pointer to pmd on msg->private to avoid a lookup when
-	 * handling the ack
-	 */
-	remotecache_page_metadata_get(pmd);
-	spin_lock_irqsave(&metadata->lock, irq_flags);
-	if (test_and_clear_bit(RC_PAGE_LRU, &pmd->flags))
-		metadata->policy->remove(metadata, pmd);
-	spin_unlock_irqrestore(&metadata->lock, irq_flags);
-	if (!msg->private) {
-		msg->private = pmd;
-	} else {
-		struct remotecache_page_metadata *prev = msg->private;
-		list_add_tail(&pmd->lru, &prev->lru);
-	}
-
-	/* Now we can update middle len size and initialize next middle */
-	msg->middle.iov_len += sizeof(*middle);
-	middle->ino = cpu_to_le64(key.u.ino);
-	middle->index = cpu_to_le64(index);
-
-	/*
 	 * We try to copy the page content to an aother pre-allocated
 	 * page to avoid page frame reclaiming algorithm to wait for the
 	 * ack. If it is not possible to get pre-allocated page from the
@@ -1124,7 +1116,7 @@ static void __remotecache_put_page(int pool_id, struct cleancache_filekey key,
 	 * used by the page frame reclaiming algorithm to wait for the
 	 * ack.
 	 */
-	if ((dst_page = mempool_alloc(remotecache_page_pool, GFP_NOWAIT))) {
+	if (dst_page) {
 		char *src, *dst;
 
 		rc_debug("%s: try copy page %p to page %p in mempool\n",
@@ -1154,8 +1146,22 @@ static void __remotecache_put_page(int pool_id, struct cleancache_filekey key,
 		 */
 		if (remotecache_strategy == RC_STRATEGY_INCLUSIVE)
 			remotecache_metadata_set_page(pmd, dst_page);
+
+		this_node->stats.n_fast_put++;
 	} else {
 kmap_failure:
+		/*
+		 * cleanup everything if we do not allow to force a put
+		 */
+		if (!remotecache_slow_put) {
+			if (list_empty(&msg->list_head))
+				rc_msg_put(msg);
+			spin_lock_irqsave(&metadata->lock, irq_flags);
+			__remotecache_metadata_remove(metadata, pmd);
+			spin_unlock_irqrestore(&metadata->lock, irq_flags);
+			this_node->stats.n_aborted_put++;
+			goto out;
+		}
 		rc_debug("%s: put page %p msg %p\n", __func__, page, msg);
 
 		/*
@@ -1170,7 +1176,29 @@ kmap_failure:
 		rc_msg_add_page(msg, page);
 		if (remotecache_strategy == RC_STRATEGY_INCLUSIVE)
 			remotecache_metadata_set_page(pmd, page);
+		this_node->stats.n_slow_put++;
 	}
+
+	/*
+	 * We keep a pointer to pmd on msg->private to avoid a lookup when
+	 * handling the ack
+	 */
+	remotecache_page_metadata_get(pmd);
+	spin_lock_irqsave(&metadata->lock, irq_flags);
+	if (test_and_clear_bit(RC_PAGE_LRU, &pmd->flags))
+		metadata->policy->remove(metadata, pmd);
+	spin_unlock_irqrestore(&metadata->lock, irq_flags);
+	if (!msg->private) {
+		msg->private = pmd;
+	} else {
+		struct remotecache_page_metadata *prev = msg->private;
+		list_add_tail(&pmd->lru, &prev->lru);
+	}
+
+	/* Now we can update middle len size and initialize next middle */
+	msg->middle.iov_len += sizeof(*middle);
+	middle->ino = cpu_to_le64(key.u.ino);
+	middle->index = cpu_to_le64(index);
 
 	msg->header.middle_len = cpu_to_le32(msg->middle.iov_len);
 
@@ -1185,6 +1213,8 @@ kmap_failure:
 out:
 	if (pmd)
 		remotecache_page_metadata_put(pmd);
+	if (dst_page)
+		put_page(dst_page);
 	remotecache_metadata_put(metadata);
 }
 
@@ -1534,6 +1564,7 @@ static void __handle_get_response(struct remotecache_session *session,
 	 */
 	if (atomic_add_return(msg->nr_pages+res->nr_miss, &request->nr_received) == request->nr_pages) {
 		struct timespec delay;
+		getnstimeofday(&delay);
 
 		if (request->has_pages) {
 			int i;
@@ -1555,7 +1586,6 @@ static void __handle_get_response(struct remotecache_session *session,
 		}
 
 		/* Updating client statistics */
-		getnstimeofday(&delay);
 		delay = timespec_sub(delay, request->stamp);
 
 		rc_stats_update_avg(&this_node->stats.get_avg_time, &delay);
