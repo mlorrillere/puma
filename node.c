@@ -886,7 +886,8 @@ static ssize_t node_show_stats(struct rc_stats *stats, char *buf)
 	count += scnprintf(buf, PAGE_SIZE,
 			"%lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu "
 			"%lu.%09lu %lu.%09lu %lu.%09lu %lu.%09lu "
-			"%lu.%09lu %lu.%09lu %lu.%09lu %lu.%09lu %lu %lu %lu",
+			"%lu.%09lu %lu.%09lu %lu.%09lu %lu.%09lu %lu %lu %lu "
+			"%lu",
 			n->stats.nget, n->stats.nget_msg,
 			n->stats.n_rc_hit + n->stats.n_rc_miss,
 			n->stats.nput, n->stats.nput_msg,
@@ -911,7 +912,8 @@ static ssize_t node_show_stats(struct rc_stats *stats, char *buf)
 			n->stats.put_max_time.tv_nsec,
 			n->stats.n_fast_put,
 			n->stats.n_slow_put,
-			n->stats.n_aborted_put);
+			n->stats.n_aborted_put,
+			n->stats.n_get_expired);
 
 	count += scnprintf(buf+count, PAGE_SIZE-count, "\n\nmetadata:\n");
 
@@ -950,7 +952,7 @@ static ssize_t node_show_stats(struct rc_stats *stats, char *buf)
 	count += scnprintf(buf+count, PAGE_SIZE-count,
 			"\tget (pages, messages): %lu %lu\n"
 			"\tget response (hit+miss): %lu\n"
-			"\tput (pages, messages): %lu %lu %lu %lu %lu\n"
+			"\tput (pages, messages, fast, slow, aborted): %lu %lu %lu %lu %lu\n"
 			"\tput acked: %lu\n"
 			"\tnon dirtied put: %lu\n"
 			"\tinvalidate pages: %lu\n"
@@ -958,6 +960,7 @@ static ssize_t node_show_stats(struct rc_stats *stats, char *buf)
 			"\tremote invalidate pages: %lu\n"
 			"\trc hit: %lu\n"
 			"\trc miss: %lu\n"
+			"\trc expired: %lu\n"
 			"\trc miss avoided: %lu\n"
 			"\tget delay: %lu.%09lu %lu.%09lu %lu.%09lu %lu.%09lu\n"
 			"\tput delay: %lu.%09lu %lu.%09lu %lu.%09lu %lu.%09lu\n",
@@ -973,6 +976,7 @@ static ssize_t node_show_stats(struct rc_stats *stats, char *buf)
 			n->stats.n_invalidate_inodes,
 			n->stats.n_remote_invalidate,
 			n->stats.n_rc_hit, n->stats.n_rc_miss,
+			n->stats.n_get_expired,
 			n->stats.n_rc_miss_avoided,
 			get_avg.tv_sec, get_avg.tv_nsec,
 			get_msg_avg.tv_sec, get_msg_avg.tv_nsec,

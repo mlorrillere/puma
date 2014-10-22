@@ -62,6 +62,9 @@ struct rc_stats {
 	/* Number of aborted put due to empty memory pool */
 	unsigned long n_aborted_put;
 
+	/* Number of get request expired */
+	unsigned long n_get_expired;
+
 	/* Time needed for a RC_MSG_GET to complete */
 	struct timespec send_max_time;
 	struct timespec send_min_time;

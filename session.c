@@ -34,10 +34,12 @@
  */
 bool remotecache_suspend_disable_get = false;
 bool remotecache_slow_put = false;
+int remotecache_timeout_usec = 1000;
 
 module_param_named(suspend_disable_get, remotecache_suspend_disable_get,
 		bool, 0666);
 module_param_named(enable_slow_put, remotecache_slow_put, bool, 0666);
+module_param_named(timeout_usec, remotecache_timeout_usec, int, 0666);
 
 struct remotecache_session *remotecache_session_create(
 		struct remotecache_node *node)
@@ -1347,6 +1349,7 @@ out:
 /*
  * remotecache request handling
  */
+enum hrtimer_restart request_timeout(struct hrtimer *timer);
 static struct remotecache_request *remotecache_request_create(
 		struct remotecache_session *session, int nr_pages)
 {
@@ -1370,16 +1373,20 @@ static struct remotecache_request *remotecache_request_create(
 	}
 
 	kref_init(&request->kref);
+	spin_lock_init(&request->lock);
 	getnstimeofday(&request->stamp);
+	hrtimer_init(&request->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	request->timer.function = request_timeout;
 	atomic_set(&request->nr_received, 0);
 	INIT_LIST_HEAD(&request->list);
 
 	request->id = atomic_long_inc_return(&idgen);
-	request->has_pages = (nr_pages > 0);
+	request->flags = 0;
+	if (nr_pages > 0)
+		__set_bit(REMOTECACHE_REQUEST_HAS_PAGES, &request->flags);
 	request->nr_pages = 0;
 	request->session = session;
 	request->bh = NULL;
-	request->sync = false;
 
 	return request;
 }
@@ -1418,7 +1425,7 @@ static void __request_page_swap(void *a, void *b, int size)
 static struct page *remotecache_request_page_lookup(
 		struct remotecache_request *request, pgoff_t index)
 {
-	if (request->has_pages) {
+	if (test_bit(REMOTECACHE_REQUEST_HAS_PAGES, &request->flags)) {
 		struct page **p = bsearch(&index, request->pages,
 				request->nr_pages, sizeof(struct page*),
 				__request_page_cmp_bsearch);
@@ -1450,13 +1457,11 @@ static void __remotecache_request_last_put(struct kref *ref)
 	struct remotecache_request *r =
 		container_of(ref, struct remotecache_request, kref);
 
-	BUG_ON(atomic_read(&r->nr_received) != r->nr_pages);
-
 	mutex_lock(&r->session->r_lock);
 	list_del_init(&r->list);
 	mutex_unlock(&r->session->r_lock);
 
-	if (r->has_pages)
+	if (test_bit(REMOTECACHE_REQUEST_HAS_PAGES, &r->flags))
 		kfree(r->pages);
 	kfree(r);
 }
@@ -1472,6 +1477,67 @@ static void remotecache_request_put(struct remotecache_request *r)
 }
 
 DECLARE_WAIT_QUEUE_HEAD(wait_readpage_sync);
+
+static void submit_request_pages(struct remotecache_request *request) {
+	if (test_bit(REMOTECACHE_REQUEST_HAS_PAGES, &request->flags)) {
+		int i;
+		for (i = 0; i < request->nr_pages; ++i)
+			unlock_page(request->pages[i]);
+	} else if (request->bh) {
+		rc_debug("%s calling b_end_io(%p, %d)\n", __func__,
+			request->bh, PageUptodate(request->page));
+		request->bh->b_end_io(request->bh, PageUptodate(request->page));
+	} else if (test_bit(REMOTECACHE_REQUEST_SYNC, &request->flags)) {
+		wake_up(&wait_readpage_sync);
+	} else {
+		unlock_page(request->page);
+	}
+}
+
+enum hrtimer_restart request_timeout(struct hrtimer *timer)
+{
+	unsigned long m_flags, r_flags;
+	struct remotecache_metadata *metadata;
+	struct remotecache_request *request = container_of(timer,
+			struct remotecache_request, timer);
+	int pool;
+
+	/* we already received the response */
+	set_bit(REMOTECACHE_REQUEST_CANCELED, &request->flags);
+
+	if (test_bit(REMOTECACHE_REQUEST_HAS_PAGES, &request->flags))
+		pool = get_poolid_from_fake(request->pages[0]->mapping->host->i_sb->cleancache_poolid);
+	else
+		pool = get_poolid_from_fake(request->page->mapping->host->i_sb->cleancache_poolid);
+
+	rc_debug("%s timeout for request %p id %lu pool %d\n", __func__,
+			request, request->id, pool);
+	metadata = remotecache_node_metadata(this_node, pool, NULL_UUID_LE);
+
+	spin_lock_irqsave(&request->lock, r_flags);
+	spin_lock_irqsave(&metadata->lock, m_flags);
+	if (test_bit(REMOTECACHE_REQUEST_HAS_PAGES, &request->flags)) {
+		int i;
+		for (i = 0; i < request->nr_pages; ++i) {
+			struct page *p = request->pages[i];
+			if (!PageUptodate(p))
+				__remotecache_metadata_erase(metadata, p->mapping->host->i_ino, p->index);
+		}
+	} else {
+		struct page *p = request->page;
+		if (!PageUptodate(p))
+			__remotecache_metadata_erase(metadata, p->mapping->host->i_ino, p->index);
+	}
+	spin_unlock_irqrestore(&metadata->lock, m_flags);
+	spin_unlock_irqrestore(&request->lock, r_flags);
+
+	this_node->stats.n_get_expired += request->nr_pages;
+
+	submit_request_pages(request);
+	remotecache_metadata_put(metadata);
+
+	return HRTIMER_NORESTART;
+}
 
 static void __handle_get_response(struct remotecache_session *session,
 		struct rc_msg *msg)
@@ -1504,7 +1570,18 @@ static void __handle_get_response(struct remotecache_session *session,
 			(unsigned long) le64_to_cpu(res->req_id),
 			nr_middle, msg->nr_pages, res->nr_miss);
 
+	spin_lock_irqsave(&request->lock, flags);
+	if (test_bit(REMOTECACHE_REQUEST_CANCELED, &request->flags)) {
+		spin_unlock_irqrestore(&request->lock, flags);
+		if (atomic_add_return(msg->nr_pages+res->nr_miss, &request->nr_received) == request->nr_pages) {
+			hrtimer_cancel(&request->timer);
+			remotecache_request_put(request);
+		}
+		goto out;
+	}
+
 	for (i = 0; i < msg->nr_pages; ++i) {
+		unsigned long flags;
 		struct page *page = msg->pages[i];
 		middle = msg->middle.iov_base+sizeof(*middle)*i;
 		index = le64_to_cpu(middle->index);
@@ -1541,8 +1618,9 @@ static void __handle_get_response(struct remotecache_session *session,
 	 * update metadata to remove missing pages
 	 */
 	if (res->nr_miss) {
+		unsigned long flags;
 		spin_lock_irqsave(&metadata->lock, flags);
-		if (request->has_pages) {
+		if (test_bit(REMOTECACHE_REQUEST_HAS_PAGES, &request->flags)) {
 			int i;
 			for (i = 0; i < request->nr_pages; ++i) {
 				struct page *p = request->pages[i];
@@ -1558,7 +1636,7 @@ static void __handle_get_response(struct remotecache_session *session,
 		spin_unlock_irqrestore(&metadata->lock, flags);
 	}
 	remotecache_metadata_put(metadata);
-
+	spin_unlock_irqrestore(&request->lock, flags);
 	/*
 	 * Free request and update stats if we received enough responses
 	 */
@@ -1566,24 +1644,10 @@ static void __handle_get_response(struct remotecache_session *session,
 		struct timespec delay;
 		getnstimeofday(&delay);
 
-		if (request->has_pages) {
-			int i;
-			for (i = 0; i < request->nr_pages; ++i)
-				unlock_page(request->pages[i]);
-		} else if (request->bh) {
-			rc_debug("%s calling b_end_io(%p, %d)\n", __func__,
-				request->bh, PageUptodate(request->page));
-			pr_err("%s req %lu bh %p page %p ino %lu index %lu\n",
-				__func__, request->id, request->bh,
-				request->bh->b_page, ino,
-				request->bh->b_page->index);
-			request->bh->b_end_io(request->bh,
-				PageUptodate(request->page));
-		} else if (request->sync) {
-			wake_up(&wait_readpage_sync);
-		} else {
-			unlock_page(request->page);
-		}
+		hrtimer_cancel(&request->timer);
+
+		if (!test_bit(REMOTECACHE_REQUEST_CANCELED, &request->flags))
+			submit_request_pages(request);
 
 		/* Updating client statistics */
 		delay = timespec_sub(delay, request->stamp);
@@ -1593,7 +1657,7 @@ static void __handle_get_response(struct remotecache_session *session,
 		rc_stats_update_max(&this_node->stats.get_max_time, &delay);
 		remotecache_request_put(request);
 	}
-
+out:
 	msg->nr_pages = 0;
 	rc_msg_put(msg);
 }
@@ -1765,6 +1829,7 @@ static void remotecache_session_alloc_data(struct rc_connection *con, struct rc_
 			struct remotecache_session, con);
 
 	if (le16_to_cpu(msg->header.type) == RC_MSG_TYPE_GET_RESPONSE) {
+		unsigned long flags;
 		struct remotecache_request *request;
 		struct rc_get_response *response = msg->front.iov_base;
 		struct rc_get_response_middle *middle;
@@ -1778,6 +1843,13 @@ static void remotecache_session_alloc_data(struct rc_connection *con, struct rc_
 		BUG_ON(!request);
 
 		BUG_ON(nr_pages > request->nr_pages);
+
+		/* request has expired */
+		spin_lock_irqsave(&request->lock, flags);
+		if (test_bit(REMOTECACHE_REQUEST_CANCELED, &request->flags)) {
+			spin_unlock_irqrestore(&request->lock, flags);
+			return;
+		}
 
 		for (n = 0; n < nr_middle; ++n) {
 			pgoff_t index;
@@ -1797,6 +1869,7 @@ static void remotecache_session_alloc_data(struct rc_connection *con, struct rc_
 
 			msg->pages[n] = page;
 		}
+		spin_unlock_irqrestore(&request->lock, flags);
 
 	} else if (le16_to_cpu(msg->header.type == RC_MSG_TYPE_PUT)) {
 		int nr_pages = le32_to_cpu(msg->header.data_len)/PAGE_SIZE;
@@ -1913,7 +1986,7 @@ wait_for_busy_page:
 busy_ok:
 	unlock_remotecache_page_metadata(pmd);
 
-	if (request->has_pages) {
+	if (test_bit(REMOTECACHE_REQUEST_HAS_PAGES, &request->flags)) {
 		list_del_init(&page->lru);
 		if (!add_to_page_cache_lru(page, mapping,
 					page->index, GFP_KERNEL)) {
@@ -1945,7 +2018,7 @@ busy_ok:
 	}
 
 abort:
-	if (request->has_pages)
+	if (test_bit(REMOTECACHE_REQUEST_HAS_PAGES, &request->flags))
 		page_cache_release(page);
 
 	if (pmd) {
@@ -1980,7 +2053,12 @@ static void __send_request(struct remotecache_session *session,
 	unsigned sent = 0, nr_to_send;
 
 	remotecache_request_get(request);
-	if (request->has_pages)
+	if (remotecache_timeout_usec > 0) {
+		hrtimer_start(&request->timer, ktime_set(0,
+				remotecache_timeout_usec * USEC_PER_MSEC),
+			HRTIMER_MODE_REL);
+	}
+	if (test_bit(REMOTECACHE_REQUEST_HAS_PAGES, &request->flags))
 		sort(request->pages, request->nr_pages, sizeof(struct page *),
 				__request_page_cmp_sort, __request_page_swap);
 	do {
@@ -2012,7 +2090,7 @@ static void __send_request(struct remotecache_session *session,
 		/*
 		 * Add first page to the middle
 		 */
-		if (request->has_pages)
+		if (test_bit(REMOTECACHE_REQUEST_HAS_PAGES, &request->flags))
 			middle->index =	cpu_to_le64(request->pages[sent]->index);
 		else
 			middle->index = cpu_to_le64(request->page->index);
@@ -2070,7 +2148,7 @@ void remotecache_node_readpage_sync(struct file *file, struct page *page)
 		return;
 	}
 
-	request->sync = true;
+	__set_bit(REMOTECACHE_REQUEST_SYNC, &request->flags);
 
 	if (__request_add_page(page, page->mapping, request)) {
 		mutex_lock(&session->r_lock);
@@ -2080,7 +2158,9 @@ void remotecache_node_readpage_sync(struct file *file, struct page *page)
 		if (request->page) {
 			__send_request(session, request, page->mapping);
 
-			while (!atomic_read(&request->nr_received)) {
+			while (!atomic_read(&request->nr_received) &&
+					!test_bit(REMOTECACHE_REQUEST_CANCELED,
+						&request->flags)) {
 				DEFINE_WAIT(wait);
 
 				prepare_to_wait(&wait_readpage_sync, &wait,

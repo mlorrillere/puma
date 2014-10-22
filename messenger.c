@@ -145,6 +145,11 @@ const char *rc_pr_addr(const struct sockaddr_storage *ss)
  */
 static struct workqueue_struct *rc_msgr_wq;
 
+/*
+ * Empty page used in certain error cases
+ */
+struct page *empty_page = NULL;
+
 static void _rc_msgr_exit(void)
 {
 	if (rc_msgr_wq) {
@@ -156,6 +161,11 @@ static void _rc_msgr_exit(void)
 		kmem_cache_destroy(remotecache_msg_cachep);
 		remotecache_msg_cachep = NULL;
 	}
+
+	if (empty_page) {
+		put_page(empty_page);
+		empty_page = NULL;
+	}
 }
 
 int rc_messenger_init(void)
@@ -165,7 +175,14 @@ int rc_messenger_init(void)
 			SLAB_MEM_SPREAD|SLAB_PANIC, NULL);
 	if (!remotecache_msg_cachep) {
 		pr_err("%s: failed to create msg slab\n", __func__);
-		_rc_msgr_exit();
+		goto error;
+	}
+
+	BUG_ON(empty_page != NULL);
+	empty_page = alloc_page(GFP_KERNEL);
+	if (!empty_page) {
+		pr_err("%s: failed to create empty page\n", __func__);
+		goto error;
 	}
 
 	rc_msgr_wq = alloc_workqueue("remotecache-msgr",
@@ -174,8 +191,9 @@ int rc_messenger_init(void)
 		return 0;
 
 	pr_err("msgr_init failed to create workqueue\n");
-	_rc_msgr_exit();
 
+error:
+	_rc_msgr_exit();
 	return -ENOMEM;
 }
 
@@ -1227,7 +1245,10 @@ static int read_partial_message_pages(struct rc_connection *con,
 		   (int)(PAGE_SIZE - con->in_msg_pos.page_pos));
 	/* (page) data */
 	BUG_ON(pages == NULL);
-	p = kmap_atomic(pages[con->in_msg_pos.page]);
+	if (pages[con->in_msg_pos.page])
+		p = kmap_atomic(pages[con->in_msg_pos.page]);
+	else
+		p = kmap_atomic(empty_page);
 	ret = __rc_tcp_recvmsg(con->sock, p + con->in_msg_pos.page_pos,
 			       left);
 	if (ret > 0)

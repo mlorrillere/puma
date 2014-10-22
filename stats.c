@@ -66,6 +66,7 @@ void rc_stats_reset(struct rc_stats *stats)
 	stats->n_fast_put = 0;
 	stats->n_slow_put = 0;
 	stats->n_aborted_put = 0;
+	stats->n_get_expired = 0;
 	stats->nput_acked = 0;
 	stats->n_non_dirtied_put = 0;
 	stats->n_invalidate_pages = 0;
@@ -139,6 +140,7 @@ RC_STATS_ATTR_TYPE(nput, 0444, ulong);
 RC_STATS_ATTR_TYPE(n_fast_put, 0444, ulong);
 RC_STATS_ATTR_TYPE(n_slow_put, 0444, ulong);
 RC_STATS_ATTR_TYPE(n_aborted_put, 0444, ulong);
+RC_STATS_ATTR_TYPE(n_get_expired, 0444, ulong);
 RC_STATS_ATTR_TYPE(nput_acked, 0444, ulong);
 RC_STATS_ATTR_TYPE(n_non_dirtied_put, 0444, ulong);
 RC_STATS_ATTR_TYPE(n_invalidate_pages, 0444, ulong);
@@ -169,6 +171,7 @@ static const struct attribute *attributes[] = {
 	&rc_stats_n_fast_put.attr,
 	&rc_stats_n_slow_put.attr,
 	&rc_stats_n_aborted_put.attr,
+	&rc_stats_n_get_expired.attr,
 	&rc_stats_nput_acked.attr,
 	&rc_stats_n_non_dirtied_put.attr,
 	&rc_stats_n_invalidate_pages.attr,

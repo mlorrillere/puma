@@ -10,6 +10,7 @@
 #define SESSION_H
 
 #include <linux/time.h>
+#include <linux/hrtimer.h>
 #include <linux/kref.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
@@ -45,12 +46,21 @@ enum remotecache_session_flags {
 	REMOTECACHE_SESSION_SUSPENDED
 };
 
+enum remotecache_request_flags {
+	REMOTECACHE_REQUEST_HAS_PAGES,
+	REMOTECACHE_REQUEST_SYNC,
+	REMOTECACHE_REQUEST_CANCELED
+};
+
 /* Tracking of remotecache requests */
 struct remotecache_request {
 	struct kref kref;
+	spinlock_t lock;
 	unsigned long id;	/* request-id */
+	unsigned long flags;
 	struct timespec stamp;	/* timestamp used for response time
 				   calculation */
+	struct hrtimer timer;
 
 	struct remotecache_session *session;
 
@@ -65,8 +75,6 @@ struct remotecache_request {
 
 	unsigned nr_pages;	/* Number of pages */
 	atomic_t nr_received;	/* Number of pages already handled */
-	bool has_pages;		/* use of ->page or ->pages ? */
-	bool sync;
 };
 
 extern struct rc_connection_operations session_ops;
