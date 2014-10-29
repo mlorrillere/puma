@@ -50,6 +50,7 @@ struct rc_get_request {
 } __packed;
 
 struct rc_get_response {
+	__le64 available;
 	__le64 req_id;
 	__le32 pool_id;	/* identifier of the source filesystem */
 	__le64 ino;	/* inode number from where the pages comes from */
@@ -80,6 +81,7 @@ struct rc_invalidate_ino_request {
 } __packed;
 
 struct rc_invalidate_page_request {
+	__le64 available;
 	__le32 pool_id;	/* identifier of the source filesystem */
 } __packed;
 

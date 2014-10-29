@@ -37,6 +37,8 @@ struct remotecache_session {
 
 	struct mutex r_lock;	 /* lock to protect ->requests */
 
+	unsigned long available;	/* remote cache size (estimation) */
+
 	unsigned long flags;
 
 	/* TODO: remote statistics (memory, latency, bandwidth, cpu usage) */

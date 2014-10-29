@@ -35,11 +35,14 @@
 bool remotecache_suspend_disable_get = false;
 bool remotecache_slow_put = false;
 int remotecache_timeout_usec = 1000;
+bool remotecache_enable_remote_shadow = false;
 
 module_param_named(suspend_disable_get, remotecache_suspend_disable_get,
 		bool, 0666);
 module_param_named(enable_slow_put, remotecache_slow_put, bool, 0666);
 module_param_named(timeout_usec, remotecache_timeout_usec, int, 0666);
+module_param_named(enable_remote_shadow, remotecache_enable_remote_shadow,
+		bool, 0666);
 
 struct remotecache_session *remotecache_session_create(
 		struct remotecache_node *node)
@@ -56,6 +59,7 @@ struct remotecache_session *remotecache_session_create(
 	INIT_LIST_HEAD(&session->caches);
 	mutex_init(&session->c_lock);
 	mutex_init(&session->r_lock);
+	session->available = UINT_MAX;
 	session->flags = 0;
 
 	session->node = node;
@@ -192,6 +196,54 @@ bool match_pool_id(struct rc_msg *m, void *arg)
 }
 
 /*
+ * Taken from fs/proc/meminfo.c
+ */
+static unsigned long get_available_pages_count(void)
+{
+	struct sysinfo i;
+	long available;
+	unsigned long pagecache;
+	unsigned long wmark_low = 0;
+	struct zone *zone;
+
+	si_meminfo(&i);
+
+	for_each_zone(zone)
+		wmark_low += zone->watermark[WMARK_LOW];
+
+	/*
+	 * Estimate the amount of memory available for userspace allocations,
+	 * without causing swapping.
+	 *
+	 * Free memory cannot be taken below the low watermark, before the
+	 * system starts swapping.
+	 */
+	available = i.freeram - wmark_low;
+
+	/*
+	 * Not all the page cache can be freed, otherwise the system will
+	 * start swapping. Assume at least half of the page cache, or the
+	 * low watermark worth of cache, needs to stay.
+	 */
+	pagecache = global_page_state(NR_INACTIVE_FILE);
+	pagecache += global_page_state(NR_ACTIVE_FILE);
+	pagecache -= min(pagecache / 2, wmark_low);
+	available += pagecache;
+
+	/*
+	 * Part of the reclaimable slab consists of items that are in use,
+	 * and cannot be freed. Cap this estimate at the low watermark.
+	 */
+	available += global_page_state(NR_SLAB_RECLAIMABLE) -
+		     min(global_page_state(NR_SLAB_RECLAIMABLE) / 2, wmark_low);
+
+	if (available < 0)
+		available = 0;
+
+	return available;
+}
+
+/*
  * Dispatch functions
  *
  * If metadata is true, then we want to invalidate peer's metadata? Otherwise
@@ -246,7 +298,7 @@ new_request:
 
 		front = request->front.iov_base;
 		front->pool_id	= cpu_to_le32(pool_id);
-
+		front->available = cpu_to_le64(get_available_pages_count());
 		request->middle.iov_len = sizeof(*middle);
 		request->header.middle_len = cpu_to_le32(request->middle.iov_len);
 		middle = request->middle.iov_base;
@@ -467,6 +519,7 @@ static void __handle_get(struct remotecache_session *session, struct rc_msg *msg
 		BUG();
 	}
 	front = res->front.iov_base;
+	front->available = cpu_to_le64(get_available_pages_count());
 	front->req_id = request->req_id;
 	front->pool_id = request->pool_id;
 	front->ino = request->ino;
@@ -740,6 +793,7 @@ static void __invalidate_page_metadata(struct remotecache_session *session,
 	spin_unlock_irqrestore(&metadata->lock, flags);
 
 	this_node->stats.n_remote_invalidate += count;
+	session->available = le64_to_cpu(inv_page->available);
 
 	remotecache_metadata_put(metadata);
 }
@@ -1006,6 +1060,15 @@ static void __remotecache_put_page(int pool_id, struct cleancache_filekey key,
 			 */
 			break;
 		}
+	}
+
+	if (remotecache_enable_remote_shadow &&
+			!TestClearPageShouldRemote(page)) {
+		if (pmd)
+			__remotecache_metadata_remove(metadata, pmd);
+		spin_unlock_irqrestore(&metadata->lock, irq_flags);
+		this_node->stats.n_refault_put++;
+		goto out;
 	}
 
 	dst_page = mempool_alloc(remotecache_page_pool, GFP_NOWAIT);
@@ -1613,6 +1676,7 @@ static void __handle_get_response(struct remotecache_session *session,
 	}
 	this_node->stats.n_rc_hit += nr_middle;
 	this_node->stats.n_rc_miss += res->nr_miss;
+	session->available = le64_to_cpu(res->available);
 
 	/*
 	 * update metadata to remove missing pages

@@ -451,6 +451,35 @@ static int remotecache_node_suspend_param_get(char *buffer, const struct kernel_
 				&this_node->flags) ? 'Y' : 'N');
 }
 
+static bool remotecache_node_refault(void *shadow)
+{
+	unsigned long refault_distance, flags, remote_size = 0;
+	struct remotecache_session *s;
+	struct zone *zone;
+
+	spin_lock_irqsave(&this_node->s_lock, flags);
+	list_for_each_entry(s, &this_node->sessions, list) {
+		remote_size += s->available;
+	}
+	spin_unlock_irqrestore(&this_node->s_lock, flags);
+
+	if (remotecache_strategy == RC_STRATEGY_INCLUSIVE) {
+		unsigned long cache = global_page_state(NR_INACTIVE_FILE) +
+				global_page_state(NR_ACTIVE_FILE) / 2;
+		if (remote_size < cache)
+			remote_size = 0;
+		else
+			remote_size -= cache;
+	}
+
+	unpack_shadow(shadow, &zone, &refault_distance);
+
+	if (refault_distance <= remote_size) {
+		return true;
+	}
+	return false;
+}
+
 struct kernel_param_ops remotecache_node_suspend_param_ops = {
 	.set = remotecache_node_suspend_param_set,
 	.get = remotecache_node_suspend_param_get
@@ -470,6 +499,7 @@ static struct remotecache_ops remotecache_node_ops = {
 	.suspend = remotecache_node_suspend_op,
 	.resume = remotecache_node_resume_op,
 	.is_suspended = remotecache_node_is_suspended_op,
+	.refault = remotecache_node_refault
 };
 
 /*
@@ -887,7 +917,7 @@ static ssize_t node_show_stats(struct rc_stats *stats, char *buf)
 			"%lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu %lu "
 			"%lu.%09lu %lu.%09lu %lu.%09lu %lu.%09lu "
 			"%lu.%09lu %lu.%09lu %lu.%09lu %lu.%09lu %lu %lu %lu "
-			"%lu",
+			"%lu %lu",
 			n->stats.nget, n->stats.nget_msg,
 			n->stats.n_rc_hit + n->stats.n_rc_miss,
 			n->stats.nput, n->stats.nput_msg,
@@ -913,7 +943,8 @@ static ssize_t node_show_stats(struct rc_stats *stats, char *buf)
 			n->stats.n_fast_put,
 			n->stats.n_slow_put,
 			n->stats.n_aborted_put,
-			n->stats.n_get_expired);
+			n->stats.n_get_expired,
+			n->stats.n_refault_put);
 
 	count += scnprintf(buf+count, PAGE_SIZE-count, "\n\nmetadata:\n");
 
@@ -952,7 +983,7 @@ static ssize_t node_show_stats(struct rc_stats *stats, char *buf)
 	count += scnprintf(buf+count, PAGE_SIZE-count,
 			"\tget (pages, messages): %lu %lu\n"
 			"\tget response (hit+miss): %lu\n"
-			"\tput (pages, messages, fast, slow, aborted): %lu %lu %lu %lu %lu\n"
+			"\tput (pages, messages, fast, slow, aborted, refault): %lu %lu %lu %lu %lu %lu\n"
 			"\tput acked: %lu\n"
 			"\tnon dirtied put: %lu\n"
 			"\tinvalidate pages: %lu\n"
@@ -970,6 +1001,7 @@ static ssize_t node_show_stats(struct rc_stats *stats, char *buf)
 			n->stats.n_fast_put,
 			n->stats.n_slow_put,
 			n->stats.n_aborted_put,
+			n->stats.n_refault_put,
 			n->stats.nput_acked,
 			n->stats.n_non_dirtied_put,
 			n->stats.n_invalidate_pages,

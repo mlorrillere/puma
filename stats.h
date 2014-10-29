@@ -62,6 +62,9 @@ struct rc_stats {
 	/* Number of aborted put due to empty memory pool */
 	unsigned long n_aborted_put;
 
+	/* Number of canceled put due to a high refault distance */
+	unsigned long n_refault_put;
+
 	/* Number of get request expired */
 	unsigned long n_get_expired;
 
