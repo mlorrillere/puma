@@ -62,7 +62,6 @@ struct remotecache_metadata {
 	struct list_head list;
 	struct shrinker shrinker;
 	struct remotecache_policy *policy;
-	struct remotecache_session *session;
 
 	int (*evict) (struct remotecache_metadata *metadata, struct list_head *pages);
 

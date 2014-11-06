@@ -396,7 +396,6 @@ void remotecache_metadata_init(struct remotecache_metadata *metadata)
 	metadata->pages_tree = RB_ROOT;
 
 	metadata->policy = remotecache_policy_create("lru");
-	metadata->session = NULL;
 
 	/* Shrinker initialization */
 	metadata->evict = NULL;
