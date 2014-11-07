@@ -810,8 +810,8 @@ static int enable_param_set(const char *val, const struct kernel_param *kp)
 		struct remotecache_node *n = this_node;
 
 		cleancache_register_ops(cleancache_old_ops);
-		remotecache_node_close(this_node);
 		remotecache_register_ops(NULL);
+		remotecache_node_close(this_node);
 		barrier();
 		this_node = NULL;
 		remotecache_node_destroy(n);

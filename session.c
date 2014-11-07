@@ -44,6 +44,9 @@ module_param_named(timeout_usec, remotecache_timeout_usec, int, 0666);
 module_param_named(enable_remote_shadow, remotecache_enable_remote_shadow,
 		bool, 0666);
 
+static void submit_request_pages(struct remotecache_request *request);
+static void remotecache_request_put(struct remotecache_request *r);
+
 struct remotecache_session *remotecache_session_create(
 		struct remotecache_node *node)
 {
@@ -73,8 +76,25 @@ struct remotecache_session *remotecache_session_create(
 
 void remotecache_session_close(struct remotecache_session *session)
 {
+	struct remotecache_request *r, *next;
+	LIST_HEAD(requests);
 	pr_err("%s close session %p\n", __func__, session);
+
 	rc_con_close(&session->con);
+
+	mutex_lock(&session->r_lock);
+	list_splice_init(&session->requests, &requests);
+	mutex_unlock(&session->r_lock);
+
+	list_for_each_entry_safe(r, next, &requests, list) {
+		pr_err("%s waiting for pending request %lu\n", __func__, r->id);
+		hrtimer_cancel(&r->timer);
+
+		if (!test_bit(REMOTECACHE_REQUEST_CANCELED, &r->flags))
+			submit_request_pages(r);
+		atomic_set(&r->nr_received, r->nr_pages);
+		remotecache_request_put(r);
+	}
 }
 
 void remotecache_session_last_put(struct kref *ref)
@@ -976,7 +996,6 @@ static void __remotecache_put_page(int pool_id, struct cleancache_filekey key,
 	struct remotecache_page_metadata *pmd = NULL;
 	unsigned long irq_flags;
 	BUG_ON(PageRemote(page));
-
 
 	/*
 	 * TODO: with multiple sessions, return only a useful session or NULL,
