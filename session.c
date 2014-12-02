@@ -1224,13 +1224,6 @@ static void __remotecache_put_page(int pool_id, struct cleancache_filekey key,
 
 		rc_msg_add_page(msg, dst_page);
 
-		/*
-		 * Keep the page on the remote page descriptor to allow GET
-		 * requests while PUT is pending
-		 */
-		if (remotecache_strategy == RC_STRATEGY_INCLUSIVE)
-			remotecache_metadata_set_page(pmd, dst_page);
-
 		this_node->stats.n_fast_put++;
 	} else {
 kmap_failure:
@@ -1258,8 +1251,6 @@ kmap_failure:
 		page_unfreeze_refs(page, 2);
 
 		rc_msg_add_page(msg, page);
-		if (remotecache_strategy == RC_STRATEGY_INCLUSIVE)
-			remotecache_metadata_set_page(pmd, page);
 		this_node->stats.n_slow_put++;
 	}
 
@@ -1268,10 +1259,6 @@ kmap_failure:
 	 * handling the ack
 	 */
 	remotecache_page_metadata_get(pmd);
-	spin_lock_irqsave(&metadata->lock, irq_flags);
-	if (test_and_clear_bit(RC_PAGE_LRU, &pmd->flags))
-		metadata->policy->remove(metadata, pmd);
-	spin_unlock_irqrestore(&metadata->lock, irq_flags);
 	if (!msg->private) {
 		msg->private = pmd;
 	} else {
@@ -1764,7 +1751,6 @@ static void __handle_put_ack(struct remotecache_session *session, struct rc_msg 
 	metadata = remotecache_node_metadata(this_node, pool_id, NULL_UUID_LE);
 
 	for (i = 0; i < msg->nr_pages; ++i) {
-		unsigned long flags;
 		struct page *page;
 		struct remotecache_page_metadata *pmd;
 		struct rc_put_request_middle *middle;
@@ -1788,16 +1774,6 @@ static void __handle_put_ack(struct remotecache_session *session, struct rc_msg 
 		BUG_ON(index != pmd->index);
 
 		/*
-		 * If the page were not invalidated during the put, replace it
-		 * into the lru
-		 */
-		spin_lock_irqsave(&metadata->lock, flags);
-		if (!RB_EMPTY_NODE(&pmd->rb_node)) {
-			metadata->policy->referenced(metadata, pmd);
-		}
-		spin_unlock_irqrestore(&metadata->lock, flags);
-
-		/*
 		 * Processes might be waiting on RC_PAGE_BUSY bit to be
 		 * cleared (see rc_pending_get_add). We clear the bit and
 		 * wakup those processes, then we lock the page to clear
@@ -1806,12 +1782,6 @@ static void __handle_put_ack(struct remotecache_session *session, struct rc_msg 
 		 */
 		BUG_ON(!test_and_clear_bit(RC_PAGE_BUSY, &pmd->flags));
 		wake_up_remotecache_page_metadata(pmd, RC_PAGE_BUSY);
-
-		if (remotecache_strategy == RC_STRATEGY_INCLUSIVE) {
-			lock_remotecache_page_metadata(pmd);
-			remotecache_metadata_set_page(pmd, NULL);
-			unlock_remotecache_page_metadata(pmd);
-		}
 
 		remotecache_page_metadata_put(pmd);
 
@@ -2017,46 +1987,10 @@ static int __request_add_page(struct page *page,
 	 * point our GET message might be sent before the PUT, leading to
 	 * inconsistency if the page were modified.
 	 *
-	 * First, we use an inclusive strategy, we try to copy the page
-	 * content from the pending message. We should not do this with an
-	 * exclusive strategy since it can create inconsistencies.
-	 *
-	 * Then, if we cannot copy the page from the pending message, we wait
-	 * for RC_PAGE_BUSY bit to be clear, meaning that the server received
-	 * the corresponding message.
+	 * We wait for RC_PAGE_BUSY bit to be clear, meaning that the server
+	 * received the corresponding message.
 	 */
-	lock_remotecache_page_metadata(pmd);
 	if (test_bit(RC_PAGE_BUSY, &pmd->flags)) {
-		if (remotecache_strategy == RC_STRATEGY_INCLUSIVE) {
-			void *src, *dst;
-
-			BUG_ON(!test_bit(RC_PAGE_HAS_PAGE, &pmd->flags));
-			rc_debug("%s: busy page %p ino %lu index %lu page %p\n",
-				__func__, pmd, mapping->host->i_ino,
-				page->index, pmd->private);
-
-			src = kmap_atomic(pmd->private);
-			if (!src)
-				goto wait_for_busy_page;
-
-			dst = kmap_atomic(page);
-			if (!dst) {
-				kunmap_atomic(src);
-				goto wait_for_busy_page;
-			}
-
-			copy_page(dst, src);
-			kunmap_atomic(dst);
-			kunmap_atomic(src);
-			SetPageUptodate(page);
-
-			rc_debug("%s: busy page %p pmd->private %p ino %lu index %lu pmd %p\n",
-				__func__, page, pmd->private, mapping->host->i_ino,
-				page->index, pmd);
-
-			goto busy_ok;
-		}
-wait_for_busy_page:
 		/*
 		 * If we can't copy the page, we have to wait until the page
 		 * is correctly written to the cache to avoid message
@@ -2066,8 +2000,6 @@ wait_for_busy_page:
 			__func__, pmd, mapping->host->i_ino, page->index);
 		wait_on_remotecache_page_metadata_bit(pmd, RC_PAGE_BUSY);
 	}
-busy_ok:
-	unlock_remotecache_page_metadata(pmd);
 
 	if (test_bit(REMOTECACHE_REQUEST_HAS_PAGES, &request->flags)) {
 		list_del_init(&page->lru);

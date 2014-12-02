@@ -126,7 +126,6 @@ static unsigned long shrinker_scan_objects(struct shrinker *shrinker, struct shr
 		LIST_HEAD(free_pages);
 
 		spin_lock_irqsave(&metadata->lock, flags);
-		metadata->policy->reclaim(metadata, &free_pages, sc->nr_to_scan);
 
 		nr_removed = metadata->evict(metadata, &free_pages);
 		__remotecache_metadata_remove_page_list(metadata, &free_pages);
@@ -180,8 +179,6 @@ struct remotecache_page_metadata *__remotecache_metadata_insert(struct remotecac
 		rb_insert_color(&new->rb_node, &metadata->pages_tree);
 		atomic_inc(&metadata->size);
 		remotecache_page_metadata_get(new);
-
-		metadata->policy->referenced(metadata, new);
 	} else {
 		remotecache_page_metadata_get(pmd);
 	}
@@ -200,9 +197,6 @@ void __remotecache_metadata_remove(struct remotecache_metadata *metadata,
 
 	rb_erase(&page->rb_node, &metadata->pages_tree);
 	RB_CLEAR_NODE(&page->rb_node);
-
-	if (test_and_clear_bit(RC_PAGE_LRU, &page->flags))
-		metadata->policy->remove(metadata, page);
 
 	BUG_ON(atomic_sub_return(1, &metadata->size) < 0);
 	remotecache_page_metadata_put(page);
@@ -312,8 +306,6 @@ void remotecache_page_metadata_free(struct kref *ref)
 	BUG_ON(!RB_EMPTY_NODE(&pmd->rb_node));
 	BUG_ON(!list_empty(&pmd->lru));
 
-	remotecache_metadata_set_page(pmd, 0);
-
 	mempool_free(pmd, remotecache_metadata_pool);
 }
 EXPORT_SYMBOL(remotecache_page_metadata_free);
@@ -345,8 +337,6 @@ void remotecache_metadata_release(struct kref *ref)
 	spin_lock_irqsave(&metadata->lock, flags);
 	__remotecache_metadata_clear(metadata);
 	spin_unlock_irqrestore(&metadata->lock, flags);
-
-	remotecache_policy_destroy(metadata->policy);
 }
 EXPORT_SYMBOL(remotecache_metadata_release);
 
@@ -395,8 +385,6 @@ void remotecache_metadata_init(struct remotecache_metadata *metadata)
 	spin_lock_init(&metadata->lock);
 	metadata->pages_tree = RB_ROOT;
 
-	metadata->policy = remotecache_policy_create("lru");
-
 	/* Shrinker initialization */
 	metadata->evict = NULL;
 	metadata->shrinker.count_objects = shrinker_count_objects;
@@ -420,28 +408,6 @@ static int sleep_on_remotecache_page_metadata(void *word)
 	schedule();
 	return 0;
 }
-
-bool trylock_remotecache_page_metadata(struct remotecache_page_metadata *page)
-{
-	return !test_and_set_bit_lock(RC_PAGE_LOCKED, &page->flags);
-}
-EXPORT_SYMBOL(trylock_remotecache_page_metadata);
-
-void lock_remotecache_page_metadata(struct remotecache_page_metadata *page)
-{
-	might_sleep();
-	wait_on_bit_lock(&page->flags, RC_PAGE_LOCKED,
-			sleep_on_remotecache_page_metadata, TASK_UNINTERRUPTIBLE);
-}
-EXPORT_SYMBOL(lock_remotecache_page_metadata);
-
-void unlock_remotecache_page_metadata(struct remotecache_page_metadata *page)
-{
-	clear_bit_unlock(RC_PAGE_LOCKED, &page->flags);
-	smp_mb__after_clear_bit();
-	wake_up_remotecache_page_metadata(page, RC_PAGE_LOCKED);
-}
-EXPORT_SYMBOL(unlock_remotecache_page_metadata);
 
 void wake_up_remotecache_page_metadata(struct remotecache_page_metadata *page, int bit)
 {

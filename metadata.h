@@ -18,7 +18,6 @@
 #include <linux/pagemap.h>
 
 #include "remotecache.h"
-#include "policy.h"
 
 /*
  * A remotecache page pool is created to speed up memory allocations and
@@ -29,12 +28,8 @@
 
 struct page;
 struct remotecache_metadata;
-struct remotecache_policy;
 
 enum remotecache_page_flags {
-	RC_PAGE_LOCKED,		/* Remote cache page is locked */
-	RC_PAGE_HAS_PAGE,	/* ->private points to a struct page */
-	RC_PAGE_LRU,		/* page is in the LRU */
 	RC_PAGE_BUSY,		/* page is busy (ex. during a PUT) */
 };
 
@@ -61,7 +56,6 @@ struct remotecache_metadata {
 	struct kref kref;
 	struct list_head list;
 	struct shrinker shrinker;
-	struct remotecache_policy *policy;
 
 	int (*evict) (struct remotecache_metadata *metadata, struct list_head *pages);
 
@@ -97,50 +91,6 @@ static inline void remotecache_page_metadata_get(struct remotecache_page_metadat
 static inline void remotecache_page_metadata_put(struct remotecache_page_metadata *pmd)
 {
 	kref_put(&pmd->kref, remotecache_page_metadata_free);
-}
-
-static inline void remotecache_metadata_set_page(struct remotecache_page_metadata *pmd,
-		struct page *page)
-{
-	if (page) {
-		if (test_and_set_bit(RC_PAGE_HAS_PAGE, &pmd->flags)) {
-			struct page *old;
-			BUG_ON(pmd->private == NULL);
-
-			old = pmd->private;
-			if (PagePrivate(old)) {
-				ClearPagePrivate(old);
-				ClearPageRemote(old);
-				set_page_private(old, 0);
-				__dec_zone_page_state(old, NR_FILE_PAGES);
-				release_pages(&old, 1, 0);
-			} else {
-				put_page(old);
-			}
-		} else {
-			BUG_ON(pmd->private != NULL);
-		}
-		pmd->private = page;
-		get_page(page);
-	} else {
-		if (test_and_clear_bit(RC_PAGE_HAS_PAGE, &pmd->flags)) {
-			struct page *old;
-			BUG_ON(!pmd->private);
-
-			old = pmd->private;
-			if (PagePrivate(old)) {
-				ClearPagePrivate(old);
-				ClearPageRemote(old);
-				set_page_private(old, 0);
-				__dec_zone_page_state(old, NR_FILE_PAGES);
-				release_pages(&old, 1, 0);
-			} else {
-				put_page(old);
-			}
-
-			pmd->private = NULL;
-		}
-	}
 }
 
 extern struct remotecache_page_metadata *__remotecache_metadata_lookup(
@@ -238,9 +188,6 @@ bool __remotecache_metadata_erase(struct remotecache_metadata *metadata, ino_t i
 
 void __remotecache_metadata_remove_page_list(struct remotecache_metadata *, struct list_head *);
 
-bool trylock_remotecache_page_metadata(struct remotecache_page_metadata *pmd);
-void lock_remotecache_page_metadata(struct remotecache_page_metadata *pmd);
-void unlock_remotecache_page_metadata(struct remotecache_page_metadata *pmd);
 void wake_up_remotecache_page_metadata(struct remotecache_page_metadata *pmd, int bit);
 void wait_on_remotecache_page_metadata_bit(struct remotecache_page_metadata *pmd, int bit);
 #endif /* REMOTECACHE_METADATA_H */

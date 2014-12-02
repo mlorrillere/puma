@@ -19,11 +19,9 @@
 #include <linux/hashtable.h>
 
 #include "remotecache.h"
-#include "policy.h"
 
 struct page;
 struct remotecache;
-struct remotecache_policy;
 
 struct remotecache_inode {
 	struct kref kref;
