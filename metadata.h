@@ -108,30 +108,6 @@ static inline struct remotecache_page_metadata *remotecache_metadata_lookup(
 	return ret;
 }
 
-static inline bool remotecache_metadata_contains(struct remotecache_metadata *metadata,
-		ino_t ino, pgoff_t index)
-{
-	struct remotecache_page_metadata *p =
-		remotecache_metadata_lookup(metadata, ino, index);
-	if (p) {
-		remotecache_page_metadata_put(p);
-		return true;
-	}
-	return false;
-}
-
-static inline bool __remotecache_metadata_contains(struct remotecache_metadata *metadata,
-		ino_t ino, pgoff_t index)
-{
-	struct remotecache_page_metadata *p =
-		__remotecache_metadata_lookup(metadata, ino, index);
-	if (p) {
-		remotecache_page_metadata_put(p);
-		return true;
-	}
-	return false;
-}
-
 extern struct remotecache_page_metadata *__remotecache_metadata_lookup_inode(
 		struct remotecache_metadata *metadata, ino_t ino);
 
