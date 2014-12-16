@@ -27,7 +27,10 @@ struct remotecache_inode {
 	struct kref kref;
 	struct hlist_node hash;
 	struct list_head list; /* reclaim list */
-	struct remotecache *cache;
+	union {
+		struct remotecache *cache;
+		struct remotecache *md;
+	};
 	ino_t ino;
 	struct radix_tree_root pages_tree;
 	spinlock_t lock;

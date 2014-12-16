@@ -211,9 +211,6 @@ module_param_cb(mempool_size, &remotecache_mempool_size_ops, NULL, 0644);
 
 void remotecache_node_last_put(struct kref *ref)
 {
-	struct remotecache_node *node = container_of(ref,
-			struct remotecache_node, kref);
-
 	/*
 	 * We are not supposed to go to this point since currently we do not
 	 * release the last reference (this_node) but we manually destroy the
@@ -227,8 +224,7 @@ static void remotecache_node_close(struct remotecache_node *node)
 	LIST_HEAD(sessions);
 	LIST_HEAD(metadata);
 	struct remotecache_session *session;
-	struct remotecache_metadata *m;
-	unsigned long flags;
+	struct remotecache *m;
 
 	pr_err("%s close node %p\n", __func__, node);
 
@@ -241,9 +237,9 @@ static void remotecache_node_close(struct remotecache_node *node)
 	del_timer_sync(&node->suspend_timer);
 
 	/* close and free remote nodes */
-	spin_lock_irqsave(&node->s_lock, flags);
-	list_splice_init(&node->sessions, &sessions);
-	spin_unlock_irqrestore(&node->s_lock, flags);
+	mutex_lock(&node->s_lock);
+	list_splice_init_rcu(&node->sessions, &sessions, synchronize_rcu);
+	mutex_unlock(&node->s_lock);
 
 	while (!list_empty(&sessions)) {
 		session = list_first_entry(&sessions,
@@ -252,14 +248,14 @@ static void remotecache_node_close(struct remotecache_node *node)
 	}
 
 	/* clear local metadata */
-	spin_lock_irqsave(&node->m_lock, flags);
-	list_splice_init(&node->metadata, &metadata);
-	spin_unlock_irqrestore(&node->m_lock, flags);
+	mutex_lock(&node->m_lock);
+	list_splice_init_rcu(&node->metadata, &metadata, synchronize_rcu);
+	mutex_unlock(&node->m_lock);
 
 	while (!list_empty(&metadata)) {
-		m = list_first_entry(&metadata, struct remotecache_metadata, list);
+		m = list_first_entry(&metadata, struct remotecache, list);
 		list_del_init(&m->list);
-		remotecache_metadata_put(m);
+		remotecache_put(m);
 	}
 
 	/* wait for messenger work queue to finish */
@@ -304,9 +300,6 @@ static void remotecache_node_con_put(struct rc_connection *con)
 
 static void remotecache_node_fault(struct rc_connection *con)
 {
-	struct remotecache_node *node = container_of(con,
-			struct remotecache_node, con);
-
 	pr_err("%s received fault %s", __func__, con->error_msg);
 }
 
@@ -315,14 +308,13 @@ static void remotecache_node_fault(struct rc_connection *con)
  */
 static void __do_node_suspend(struct remotecache_node *node)
 {
-	unsigned long flags;
 	struct remotecache_session *session;
 	struct rc_msg *msg;
 
-	spin_lock_irqsave(&node->s_lock, flags);
 	if (!test_and_set_bit(REMOTECACHE_NODE_SUSPENDED, &node->flags)) {
 		rc_debug("%s: suspend remote cache node\n", __func__);
-		list_for_each_entry(session, &node->sessions, list) {
+		rcu_read_lock();
+		list_for_each_entry_rcu(session, &node->sessions, list) {
 			rc_debug("%s suspend session %s\n", __func__,
 					rc_pr_addr(&session->con.peer_addr));
 			msg = rc_msg_new(RC_MSG_TYPE_SUSPEND, 0, 0, 0,
@@ -334,8 +326,8 @@ static void __do_node_suspend(struct remotecache_node *node)
 					__func__);
 			}
 		}
+		rcu_read_unlock();
 	}
-	spin_unlock_irqrestore(&node->s_lock, flags);
 }
 
 static void remotecache_node_suspend(struct remotecache_node *node)
@@ -355,18 +347,17 @@ static void remotecache_node_suspend(struct remotecache_node *node)
 
 static void __do_node_resume(struct remotecache_node *node)
 {
-	unsigned long flags;
 	struct remotecache_session *session;
 	struct rc_msg *msg;
 
-	spin_lock_irqsave(&node->s_lock, flags);
 	if (test_and_clear_bit(REMOTECACHE_NODE_SUSPENDED, &node->flags)) {
 		rc_debug("%s: resume remote cache node\n", __func__);
 
 		if (test_bit(REMOTECACHE_NODE_CLOSED, &node->flags))
-			goto out;
+			return;
 
-		list_for_each_entry(session, &node->sessions, list) {
+		rcu_read_lock();
+		list_for_each_entry_rcu(session, &node->sessions, list) {
 			rc_debug("%s resume session %s\n", __func__,
 					rc_pr_addr(&session->con.peer_addr));
 			msg = rc_msg_new(RC_MSG_TYPE_RESUME, 0, 0, 0,
@@ -378,9 +369,8 @@ static void __do_node_resume(struct remotecache_node *node)
 						 __func__);
 			}
 		}
+		rcu_read_unlock();
 	}
-out:
-	spin_unlock_irqrestore(&node->s_lock, flags);
 }
 
 static void remotecache_node_resume(struct remotecache_node *node)
@@ -453,15 +443,15 @@ static int remotecache_node_suspend_param_get(char *buffer, const struct kernel_
 
 static bool remotecache_node_refault(void *shadow)
 {
-	unsigned long refault_distance, flags, remote_size = 0;
+	unsigned long refault_distance, remote_size = 0;
 	struct remotecache_session *s;
 	struct zone *zone;
 
-	spin_lock_irqsave(&this_node->s_lock, flags);
-	list_for_each_entry(s, &this_node->sessions, list) {
+	rcu_read_lock();
+	list_for_each_entry_rcu(s, &this_node->sessions, list) {
 		remote_size += s->available;
 	}
-	spin_unlock_irqrestore(&this_node->s_lock, flags);
+	rcu_read_unlock();
 
 	if (remotecache_strategy == RC_STRATEGY_INCLUSIVE) {
 		unsigned long cache = global_page_state(NR_INACTIVE_FILE) +
@@ -507,7 +497,6 @@ static struct remotecache_ops remotecache_node_ops = {
  */
 static struct rc_connection *remotecache_node_accept(struct rc_connection *con)
 {
-	unsigned long flags;
 	struct remotecache_node *node;
 	struct remotecache_session *session;
 
@@ -519,9 +508,9 @@ static struct rc_connection *remotecache_node_accept(struct rc_connection *con)
 
 	rc_con_init(&session->con, con->private, &session_ops, &node->stats);
 
-	spin_lock_irqsave(&node->s_lock, flags);
-	list_add_tail(&session->list, &node->sessions);
-	spin_unlock_irqrestore(&node->s_lock, flags);
+	mutex_lock(&node->s_lock);
+	list_add_tail_rcu(&session->list, &node->sessions);
+	mutex_unlock(&node->s_lock);
 
 	return &session->con;
 }
@@ -530,13 +519,11 @@ struct remotecache_session *remotecache_node_session(
 		struct remotecache_node *node)
 {
 	struct remotecache_session *session = NULL;
-	unsigned long flags;
 
-	spin_lock_irqsave(&node->s_lock, flags);
-	if (!list_empty(&node->sessions))
-		session = list_first_entry(&node->sessions,
+	rcu_read_lock();
+		session = list_first_or_null_rcu(&node->sessions,
 				struct remotecache_session, list);
-	spin_unlock_irqrestore(&node->s_lock, flags);
+	rcu_read_unlock();
 
 	return session;
 }
@@ -609,23 +596,22 @@ static int remotecache_node_releasepage(struct page *page) {
 	return 1;
 }
 
-struct remotecache_metadata *remotecache_node_metadata(struct remotecache_node *node,
+struct remotecache *remotecache_node_metadata(struct remotecache_node *node,
 		int pool_id, uuid_le uuid)
 {
-	unsigned long flags;
-	struct remotecache_metadata *metadata;
+	struct remotecache *metadata;
 
 	/* TODO: do the work with UUID */
-	spin_lock_irqsave(&node->m_lock, flags);
-	list_for_each_entry(metadata, &node->metadata, list) {
+	rcu_read_lock();
+	list_for_each_entry_rcu(metadata, &node->metadata, list) {
 		if (metadata->pool_id == pool_id) {
-			remotecache_metadata_get(metadata);
-			spin_unlock_irqrestore(&node->m_lock, flags);
+			remotecache_get(metadata);
+			rcu_read_unlock();
 			return metadata;
 		}
 	}
-	spin_unlock_irqrestore(&node->m_lock, flags);
 
+	rcu_read_unlock();
 	return NULL;
 }
 
@@ -666,7 +652,6 @@ static int init_node_network(struct remotecache_node *node)
 static int remotes_param_set(const char *val, const struct kernel_param *kp)
 {
 	struct remotecache_session *s;
-	unsigned long flags;
 
 	char *ip = (char *)val;
 	char *str_port = strrchr(val, ':');
@@ -692,15 +677,15 @@ static int remotes_param_set(const char *val, const struct kernel_param *kp)
 	 * We check if we are not already connected to this remote host.
 	 * TODO: check only against IP address, not IP:PORT
 	 */
-	spin_lock_irqsave(&this_node->s_lock, flags);
-	list_for_each_entry(s, &this_node->sessions, list) {
+	rcu_read_lock();
+	list_for_each_entry_rcu(s, &this_node->sessions, list) {
 		if (strstr(rc_pr_addr(&s->con.peer_addr), ip)) {
-			spin_unlock_irqrestore(&this_node->s_lock, flags);
+			rcu_read_unlock();
 			pr_err("node already connected to host %s\n", val);
 			return -EISCONN;
 		}
 	}
-	spin_unlock_irqrestore(&this_node->s_lock, flags);
+	rcu_read_unlock();
 
 	/*
 	 * Connect to the remote host
@@ -718,18 +703,17 @@ static int remotes_param_set(const char *val, const struct kernel_param *kp)
 static int remotes_param_get(char *buf, const struct kernel_param *kp)
 {
 	struct remotecache_session *s;
-	unsigned long flags;
 	int count = 0;
 
 	if (!this_node)
 		return -EINVAL;
 
-	spin_lock_irqsave(&this_node->s_lock, flags);
-	list_for_each_entry(s, &this_node->sessions, list) {
+	rcu_read_lock();
+	list_for_each_entry_rcu(s, &this_node->sessions, list) {
 		count += scnprintf(buf+count, PAGE_SIZE-count,
 			"%s\n", rc_pr_addr(&s->con.peer_addr));
 	}
-	spin_unlock_irqrestore(&this_node->s_lock, flags);
+	rcu_read_unlock();
 
 	return count;
 }
@@ -758,8 +742,8 @@ static struct remotecache_node *create_node(void)
 
 	INIT_LIST_HEAD(&node->metadata);
 	INIT_LIST_HEAD(&node->sessions);
-	spin_lock_init(&node->s_lock);
-	spin_lock_init(&node->m_lock);
+	mutex_init(&node->m_lock);
+	mutex_init(&node->s_lock);
 	init_timer(&node->suspend_timer);
 	node->suspend_timer.function = remotecache_node_suspend_timeout;
 	node->suspend_timer.data = (unsigned long) node;
@@ -861,7 +845,6 @@ static void remotecache_node_exit(void)
 static int remotecache_node_connect(struct remotecache_node *node,
 		const char *ip, short port)
 {
-	unsigned long flags;
 	struct remotecache_session *session;
 	struct sockaddr_storage addr;
 
@@ -877,9 +860,9 @@ static int remotecache_node_connect(struct remotecache_node *node,
 		goto bad_address;
 	}
 
-	spin_lock_irqsave(&node->s_lock, flags);
-	list_add_tail(&session->list, &node->sessions);
-	spin_unlock_irqrestore(&node->s_lock, flags);
+	mutex_lock(&node->s_lock);
+	list_add_tail_rcu(&session->list, &node->sessions);
+	mutex_unlock(&node->s_lock);
 
 	pr_info("%s: connecting to %pISpc\n", __func__, &addr);
 
@@ -896,8 +879,7 @@ bad_address:
 static ssize_t node_show_stats(struct rc_stats *stats, char *buf)
 {
 	ssize_t count = 0;
-	unsigned long flags;
-	struct remotecache_metadata *m;
+	struct remotecache *m;
 	struct remotecache *c;
 	struct remotecache_session *s;
 	struct remotecache_node *n = container_of(stats,
@@ -948,18 +930,18 @@ static ssize_t node_show_stats(struct rc_stats *stats, char *buf)
 
 	count += scnprintf(buf+count, PAGE_SIZE-count, "\n\nmetadata:\n");
 
-	spin_lock_irqsave(&n->s_lock, flags);
-	list_for_each_entry(m, &n->metadata, list) {
+	rcu_read_lock();
+	list_for_each_entry_rcu(m, &n->metadata, list) {
 		count += scnprintf(buf+count, PAGE_SIZE-count,
 				"\t%pUl %d %d\n", &m->uuid, m->pool_id,
 				atomic_read(&m->size));
 	}
-	spin_unlock_irqrestore(&n->s_lock, flags);
+	rcu_read_unlock();
 
 	count += scnprintf(buf+count, PAGE_SIZE-count, "\n\nsessions:\n");
 
-	spin_lock_irqsave(&n->m_lock, flags);
-	list_for_each_entry(s, &n->sessions, list) {
+	rcu_read_lock();
+	list_for_each_entry_rcu(s, &n->sessions, list) {
 		count += scnprintf(buf+count, PAGE_SIZE-count,
 			"\thost: %s\n", rc_pr_addr(&s->con.peer_addr));
 		count += scnprintf(buf+count, PAGE_SIZE-count,
@@ -977,7 +959,7 @@ static ssize_t node_show_stats(struct rc_stats *stats, char *buf)
 				atomic_read(&c->size));
 		}
 	}
-	spin_unlock_irqrestore(&n->m_lock, flags);
+	rcu_read_unlock();
 
 	count += scnprintf(buf+count, PAGE_SIZE-count, "statistics:\n");
 	count += scnprintf(buf+count, PAGE_SIZE-count,

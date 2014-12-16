@@ -18,10 +18,6 @@
 #include <linux/cleancache.h>
 #include <linux/wait.h>
 
-#ifdef CONFIG_REMOTECACHE_DEBUG
-#include <linux/crc32c.h>
-#endif
-
 #include "session.h"
 #include "node.h"
 #include "remotecache.h"
@@ -111,12 +107,20 @@ void remotecache_session_last_put(struct kref *ref)
 	 */
 	remotecache_session_close(session);
 
-	list_del_init(&session->list);
+	mutex_lock(&session->node->s_lock);
+	list_del_rcu(&session->list);
+	synchronize_rcu();
+	INIT_LIST_HEAD(&session->list);
+	mutex_unlock(&session->node->s_lock);
 
+	mutex_lock(&session->c_lock);
 	list_for_each_entry_safe(cache, next, &session->caches, list) {
-		list_del_init(&cache->list);
+		list_del_rcu(&cache->list);
 		remotecache_put(cache);
 	}
+	mutex_unlock(&session->c_lock);
+
+	synchronize_rcu();
 
 	remotecache_node_put(session->node);
 
@@ -155,7 +159,7 @@ static struct remotecache *__session_get_cache(
 	struct remotecache *cache = NULL;
 
 	/* TODO: do the work with UUID */
-	list_for_each_entry(cache, &session->caches, list) {
+	list_for_each_entry_rcu(cache, &session->caches, list) {
 		if (cache->pool_id == pool_id)
 			goto found;
 	}
@@ -174,21 +178,22 @@ static struct remotecache *session_get_cache(
 	struct remotecache *cache;
 
 	/* TODO: do the work with UUID */
+	rcu_read_lock();
+	cache = __session_get_cache(session, pool_id, uuid);
+	rcu_read_unlock();
+
+	if (cache)
+		return cache;
+
 	mutex_lock(&session->c_lock);
 	cache = __session_get_cache(session, pool_id, uuid);
-
 	if (!cache) {
 		struct remotecache *new =
 			__session_create_cache(session, pool_id, uuid);
 
-		cache = __session_get_cache(session, pool_id, uuid);
-		if (!cache) {
-			list_add_tail(&new->list, &session->caches);
-			remotecache_get(new);
-			cache = new;
-		} else {
-			remotecache_put(new);
-		}
+		list_add_tail_rcu(&new->list, &session->caches);
+		remotecache_get(new);
+		cache = new;
 		cache->session = session;
 	}
 	mutex_unlock(&session->c_lock);
@@ -395,6 +400,8 @@ static void __handle_put(struct remotecache_session *session, struct rc_msg *msg
 		rcu_read_unlock();
 
 		if (!inode) {
+			unsigned long flags;
+
 			if (test_bit(REMOTECACHE_NODE_SUSPENDED,
 						&session->node->flags))
 				continue;
@@ -411,9 +418,9 @@ static void __handle_put(struct remotecache_session *session, struct rc_msg *msg
 
 			inode->ino = ino;
 
-			spin_lock(&cache->lock);
+			spin_lock_irqsave(&cache->lock, flags);
 			__remotecache_insert_inode(cache, inode);
-			spin_unlock(&cache->lock);
+			spin_unlock_irqrestore(&cache->lock, flags);
 		} else {
 			rc_debug("%s: use inode %p %lu\n", __func__, inode,
 					inode->ino);
@@ -574,6 +581,8 @@ repeat:
 			p = radix_tree_deref_slot(slot);
 			if (unlikely(!p))
 				continue;
+			if (radix_tree_deref_retry(p))
+				goto repeat;
 			if (unlikely(!get_page_unless_zero(p)))
 				goto repeat;
 
@@ -662,7 +671,7 @@ static void __handle_invalidate_fs(struct remotecache_session *session,
 
 	mutex_lock(&session->c_lock);
 	cache = __session_get_cache(session, pool_id, NULL_UUID_LE);
-	list_del_init(&cache->list);
+	list_del_rcu(&cache->list);
 	remotecache_put(cache); /* list reference */
 	mutex_unlock(&session->c_lock);
 
@@ -695,9 +704,10 @@ static void __handle_invalidate_ino(struct remotecache_session *session,
 	rcu_read_unlock();
 
 	if (inode) {
-		spin_lock(&cache->lock);
+		unsigned long flags;
+		spin_lock_irqsave(&cache->lock, flags);
 		__remotecache_remove_inode(inode);
-		spin_unlock(&cache->lock);
+		spin_unlock_irqrestore(&cache->lock, flags);
 
 		remotecache_inode_put(inode);
 	}
@@ -769,7 +779,7 @@ static void __invalidate_page_metadata(struct remotecache_session *session,
 {
 	struct rc_invalidate_page_request *inv_page = msg->front.iov_base;
 	struct rc_invalidate_page_request_middle *middle, *endp;
-	struct remotecache_metadata *metadata;
+	struct remotecache *metadata;
 	unsigned long flags;
 	unsigned count = 0;
 	int pool_id;
@@ -784,38 +794,45 @@ static void __invalidate_page_metadata(struct remotecache_session *session,
 	endp = msg->middle.iov_base + msg->middle.iov_len;
 
 	metadata = remotecache_node_metadata(this_node, pool_id, NULL_UUID_LE);
-	spin_lock_irqsave(&metadata->lock, flags);
 	while (middle < endp) {
 		ino_t ino = le64_to_cpu(middle->ino);
 		pgoff_t first = le64_to_cpu(middle->index),
 			last = first + middle->nr_pages;
+		struct remotecache_inode *inode;
+
+		rcu_read_lock();
+		inode = __remotecache_lookup_inode(metadata, ino);
+		rcu_read_unlock();
 
 		count += middle->nr_pages;
+
+		if (!inode) {
+			pr_err("%s inode %lu not found\n", __func__, ino);
+			middle++;
+			continue;
+		}
 
 		/*
 		 * Lookup for the first page of the [first, last] interval
 		 */
+		spin_lock_irqsave(&inode->lock, flags);
 		while (first < last) {
-			struct remotecache_page_metadata *m;
-			m = __remotecache_metadata_lookup(metadata, ino, first);
-			if (!m) {
-				rc_debug("Remotecache page (%d,%lu,%lu) not found\n",
-					pool_id, ino, first);
-			} else {
-				__remotecache_metadata_remove(metadata, m);
-				remotecache_page_metadata_put(m);
+			if (!radix_tree_tag_clear(&inode->pages_tree, first,
+						REMOTECACHE_TAG_PRESENT)) {
+				pr_warn("%s remotecache page (%d,%lu,%lu) not found\n",
+					__func__, pool_id, ino, first);
 			}
 			first++;
 		}
+		spin_unlock_irqrestore(&inode->lock, flags);
 
 		middle++;
 	}
-	spin_unlock_irqrestore(&metadata->lock, flags);
 
 	this_node->stats.n_remote_invalidate += count;
 	session->available = le64_to_cpu(inv_page->available);
 
-	remotecache_metadata_put(metadata);
+	remotecache_put(metadata);
 }
 
 /*
@@ -904,16 +921,17 @@ struct rc_msg * remotecache_session_alloc_msg(struct rc_connection *con,
 
 static void remotecache_session_fault(struct rc_connection *con)
 {
-	unsigned long flags;
 	struct remotecache_session *session = container_of(con,
 			struct remotecache_session, con);
 
 	pr_err("%s received fault %s", __func__, con->error_msg);
 
 	/* close and free session */
-	spin_lock_irqsave(&session->node->s_lock, flags);
-	list_del_init(&session->list);
-	spin_unlock_irqrestore(&session->node->s_lock, flags);
+	mutex_lock(&session->node->s_lock);
+	list_del_rcu(&session->list);
+	synchronize_rcu();
+	INIT_LIST_HEAD(&session->list);
+	mutex_unlock(&session->node->s_lock);
 
 	remotecache_session_put(session);
 }
@@ -926,21 +944,17 @@ static void remotecache_session_fault(struct rc_connection *con)
 static int __remotecache_init_fs(size_t page_size)
 {
 	static int pool_ids = 0;
-	unsigned long flags;
-	struct remotecache_metadata *metadata;
+	struct remotecache *metadata;
 
 	metadata = kzalloc(sizeof(*metadata), GFP_KERNEL);
 	BUG_ON(!metadata);
 
-	remotecache_metadata_init(metadata);
+	remotecache_init(metadata);
 	metadata->pool_id = pool_ids++;
 
-	//cache->evict = remotecache_shrinker_evict;
-	metadata->evict = NULL;
-
-	spin_lock_irqsave(&this_node->m_lock, flags);
+	mutex_lock(&this_node->m_lock);
 	list_add_tail(&metadata->list, &this_node->metadata);
-	spin_unlock_irqrestore(&this_node->m_lock, flags);
+	mutex_unlock(&this_node->m_lock);
 
 	return metadata->pool_id;
 }
@@ -990,12 +1004,18 @@ static void __remotecache_put_page(int pool_id, struct cleancache_filekey key,
 	struct rc_put_request_middle *middle;
 	struct page *dst_page = NULL;
 	short type;
-	struct remotecache_metadata *metadata;
-	struct remotecache *cache;
+	struct remotecache *cache, *metadata;
+	struct remotecache_inode *inode;
 	struct remotecache_session *session;
-	struct remotecache_page_metadata *pmd = NULL;
-	unsigned long irq_flags;
+	unsigned long flags;
+	int present = 0;
 	BUG_ON(PageRemote(page));
+
+	/* not coming from shrink_page_list */
+	if (page_count(page) != 0 || !PageLocked(page) ||
+			page->mapping->host->i_ino < 2)
+		return;
+
 
 	/*
 	 * TODO: with multiple sessions, return only a useful session or NULL,
@@ -1007,98 +1027,88 @@ static void __remotecache_put_page(int pool_id, struct cleancache_filekey key,
 		return;
 	}
 
-	if (!mutex_trylock(&session->c_lock)) {
-		rc_debug("%s node busy (session->c_lock locked)\n", __func__);
-		return;
-	}
-
-	list_for_each_entry(cache, &session->caches, list) {
+	rcu_read_lock();
+	list_for_each_entry_rcu(cache, &session->caches, list) {
 		if (atomic_read(&cache->size)) {
-			mutex_unlock(&session->c_lock);
+			rcu_read_unlock();
 			rc_debug("%s node busy\n", __func__);
 			return;
 		}
 	}
-	mutex_unlock(&session->c_lock);
+	rcu_read_unlock();
 
 	metadata = remotecache_node_metadata(this_node, pool_id, NULL_UUID_LE);
 
-	spin_lock_irqsave(&metadata->lock, irq_flags);
-	pmd = __remotecache_metadata_lookup(metadata, key.u.ino, index);
+	rcu_read_lock();
+	inode = __remotecache_lookup_inode(metadata, key.u.ino);
+	rcu_read_unlock();
 
-	/* not coming from shrink_page_list */
-	if (page_count(page) != 0 || !PageLocked(page) ||
-			page->mapping->host->i_ino < 2) {
-		WARN_ON(pmd);
-		spin_unlock_irqrestore(&metadata->lock, irq_flags);
-		goto out;
-	}
+	/*
+	 * If the inode does not exists, create a new one and insert it into
+	 * the metadata.
+	 */
+	if (!inode) {
+		rc_debug("%s: create inode %d %lu\n", __func__, pool_id, key.u.ino);
 
-	if (test_bit(REMOTECACHE_SESSION_SUSPENDED, &session->flags)) {
-		if (pmd)
-			__remotecache_metadata_remove(metadata, pmd);
-		spin_unlock_irqrestore(&metadata->lock, irq_flags);
-		goto out;
-	}
-
-	if (pmd) {
-		switch (remotecache_strategy) {
-		case RC_STRATEGY_INCLUSIVE:
-			/*
-			 * mapping->tree_lock is already locked in
-			 * __delete_from_page_cache
-			 */
-			if (!radix_tree_tag_get(&page->mapping->page_tree,
-					index, PAGECACHE_TAG_DIRTIED)) {
-#ifdef CONFIG_REMOTECACHE_DEBUG
-				u32 crc = 0;
-				void *kaddr = kmap_atomic(page);
-				BUG_ON(kaddr == NULL);
-
-				crc = crc32c(0, kaddr, PAGE_SIZE);
-				kunmap_atomic(kaddr);
-
-				if (crc != pmd->crc) {
-					pr_err("%s: bad checksum %u (%u) on " \
-						"page %p index %lu ino %lu\n",
-						__func__, crc, pmd->crc, page,
-						index,
-						page->mapping->host->i_ino);
-				}
-#endif
-				rc_debug("%s: avoid page put on non-dirtied page\n",
-						__func__);
-				this_node->stats.n_non_dirtied_put++;
-				spin_unlock_irqrestore(&metadata->lock, irq_flags);
-				goto out;
-			}
-
-			/*
-			 * We don't need to clear DIRTIED tag since the page will be
-			 * removed from page_tree
-			 */
-			break;
+		inode = remotecache_inode_alloc(GFP_ATOMIC);
+		if (!inode) {
+			pr_err("%s: could not allocate remotecache inode\n",
+					__func__);
+			goto out;
 		}
+
+		inode->ino = key.u.ino;
+
+		spin_lock_irqsave(&metadata->lock, flags);
+		__remotecache_insert_inode(metadata, inode);
+		spin_unlock_irqrestore(&metadata->lock, flags);
+	}
+
+	rcu_read_lock();
+	present = radix_tree_tag_get(&inode->pages_tree, index,
+			REMOTECACHE_TAG_PRESENT);
+	rcu_read_unlock();
+
+	/*
+	 * If the node is suspended, remove page metadata
+	 */
+	if (test_bit(REMOTECACHE_SESSION_SUSPENDED, &session->flags)) {
+		goto out_clear_present;
+	}
+
+	/*
+	 * In case of an inclusive strategy, we can avoid to send a page if it
+	 * is consistent with the version stored into the remote cache.
+	 */
+	if (present && remotecache_strategy == RC_STRATEGY_INCLUSIVE) {
+		rcu_read_lock();
+		/*
+		 * mapping->tree_lock is already locked in
+		 * __delete_from_page_cache
+		 */
+		if (!radix_tree_tag_get(&page->mapping->page_tree,
+				index, PAGECACHE_TAG_DIRTIED)) {
+			rc_debug("%s: avoid page put on non-dirtied page\n",
+					__func__);
+			this_node->stats.n_non_dirtied_put++;
+			rcu_read_unlock();
+			goto out;
+		}
+		rcu_read_unlock();
 	}
 
 	if (remotecache_enable_remote_shadow &&
 			!TestClearPageShouldRemote(page)) {
-		if (pmd)
-			__remotecache_metadata_remove(metadata, pmd);
-		spin_unlock_irqrestore(&metadata->lock, irq_flags);
 		this_node->stats.n_refault_put++;
-		goto out;
+		goto out_clear_present;
 	}
 
 	dst_page = mempool_alloc(remotecache_page_pool, GFP_NOWAIT);
 	if (dst_page) {
 		get_page(dst_page);
 	} else if (!remotecache_slow_put) {
-		if (pmd)
-			__remotecache_metadata_remove(metadata, pmd);
-		spin_unlock_irqrestore(&metadata->lock, irq_flags);
 		this_node->stats.n_aborted_put++;
-		goto out;
+		goto out_clear_present;
 	}
 
 	msg = rc_con_plug_last();
@@ -1107,11 +1117,7 @@ static void __remotecache_put_page(int pool_id, struct cleancache_filekey key,
 		if (!msg) {
 			pr_err("%s: cannot allocate put message\n",
 					__func__);
-			if (pmd)
-				__remotecache_metadata_remove(metadata, pmd);
-			spin_unlock_irqrestore(&metadata->lock, irq_flags);
-			/* TODO: remove pmd from metadata */
-			goto out;
+			goto out_clear_present;
 		}
 		middle = msg->middle.iov_base;
 	}
@@ -1126,8 +1132,7 @@ static void __remotecache_put_page(int pool_id, struct cleancache_filekey key,
 		if (!msg) {
 			pr_err("%s: cannot allocate put message\n",
 					__func__);
-			spin_unlock_irqrestore(&metadata->lock, irq_flags);
-			goto out;
+			goto out_clear_present;
 		}
 		middle = msg->middle.iov_base;
 	} else {
@@ -1142,55 +1147,29 @@ static void __remotecache_put_page(int pool_id, struct cleancache_filekey key,
 	 * with a new one. It should be safe since there is no sharing on the
 	 * server side.
 	 */
-	if (pmd && test_bit(RC_PAGE_BUSY, &pmd->flags)) {
-		pr_warn("%s: already queued pmd %p for page %p " \
-				"ino %lu index %lu\n",
-				__func__, pmd, page, key.u.ino, index);
-		__remotecache_metadata_remove(metadata, pmd);
-		remotecache_page_metadata_put(pmd);
-		pmd = NULL;
-	}
-
-	/*
-	 * Allocate a new remotecache page
-	 */
-	if (!pmd) {
-		rc_debug("%s: allocating remotecache node\n", __func__);
-		pmd = remotecache_page_metadata_alloc(GFP_NOWAIT);
-		if (!pmd) {
-			pr_err("%s: could not allocate remotecache page " \
-					"ino %lu index %lu\n", __func__,
-					key.u.ino, index);
-			/* Newly allocated message should be freed */
-			if (list_empty(&msg->list_head))
+	spin_lock_irqsave(&inode->lock, flags);
+	if (!present) {
+		int error;
+		error = radix_tree_insert(&inode->pages_tree, index,
+				(void *)RADIX_TREE_EXCEPTIONAL_ENTRY);
+		if (error && error != -EEXIST) {
+			pr_err("%s radix_tree_insert returned error %d\n",
+					__func__, error);
+			spin_unlock_irqrestore(&inode->lock, flags);
+			if (middle == msg->middle.iov_base)
 				rc_msg_put(msg);
-			spin_unlock_irqrestore(&metadata->lock, irq_flags);
 			goto out;
 		}
-		pmd->ino = key.u.ino;
-		pmd->index = index;
 
-		__remotecache_metadata_insert(metadata, pmd);
-	} else {
-		rc_debug("%s: reusing old remotecache node\n", __func__);
+		radix_tree_tag_set(&inode->pages_tree, index,
+				REMOTECACHE_TAG_PRESENT);
+		present = 1;
 	}
+	__remotecache_metadata_set_busy(inode, index);
+	spin_unlock_irqrestore(&inode->lock, flags);
 
-#ifdef CONFIG_REMOTECACHE_DEBUG
-	do {
-		void *kaddr;
-
-		kaddr = kmap_atomic(page);
-		BUG_ON(kaddr == NULL);
-		pmd->crc = crc32c(0, kaddr, PAGE_SIZE);
-		kunmap_atomic(kaddr);
-	} while (0);
-#endif
-
-	rc_debug("%s: page %p ino %lu index %lu pmd %p msg %p\n",
-			__func__, page, key.u.ino, index, pmd, msg);
-
-	BUG_ON(test_and_set_bit(RC_PAGE_BUSY, &pmd->flags));
-	spin_unlock_irqrestore(&metadata->lock, irq_flags);
+	rc_debug("%s: page %p ino %lu index %lu msg %p\n",
+			__func__, page, key.u.ino, index, msg);
 
 	/*
 	 * We try to copy the page content to an aother pre-allocated
@@ -1231,13 +1210,10 @@ kmap_failure:
 		 * cleanup everything if we do not allow to force a put
 		 */
 		if (!remotecache_slow_put) {
-			if (list_empty(&msg->list_head))
+			if (middle == msg->middle.iov_base)
 				rc_msg_put(msg);
-			spin_lock_irqsave(&metadata->lock, irq_flags);
-			__remotecache_metadata_remove(metadata, pmd);
-			spin_unlock_irqrestore(&metadata->lock, irq_flags);
 			this_node->stats.n_aborted_put++;
-			goto out;
+			goto out_clear_present;
 		}
 		rc_debug("%s: put page %p msg %p\n", __func__, page, msg);
 
@@ -1252,18 +1228,6 @@ kmap_failure:
 
 		rc_msg_add_page(msg, page);
 		this_node->stats.n_slow_put++;
-	}
-
-	/*
-	 * We keep a pointer to pmd on msg->private to avoid a lookup when
-	 * handling the ack
-	 */
-	remotecache_page_metadata_get(pmd);
-	if (!msg->private) {
-		msg->private = pmd;
-	} else {
-		struct remotecache_page_metadata *prev = msg->private;
-		list_add_tail(&pmd->lru, &prev->lru);
 	}
 
 	/* Now we can update middle len size and initialize next middle */
@@ -1282,11 +1246,22 @@ kmap_failure:
 	}
 
 out:
-	if (pmd)
-		remotecache_page_metadata_put(pmd);
+	if (inode)
+		remotecache_inode_put(inode);
 	if (dst_page)
 		put_page(dst_page);
-	remotecache_metadata_put(metadata);
+	remotecache_put(metadata);
+
+	return;
+
+out_clear_present:
+	if (present) {
+		spin_lock_irqsave(&inode->lock, flags);
+		radix_tree_tag_clear(&inode->pages_tree, index,
+				REMOTECACHE_TAG_PRESENT);
+		spin_unlock_irqrestore(&inode->lock, flags);
+	}
+	goto out;
 }
 
 /* rc_invalidate_page: implementation of the cleancache invalidate_page call */
@@ -1294,9 +1269,10 @@ static void __remotecache_invalidate_page(int pool_id, struct cleancache_filekey
 		pgoff_t index)
 {
 	unsigned long flags;
-	struct remotecache_metadata *metadata;
+	struct remotecache *metadata;
 	struct remotecache_session *session;
-	bool erased = false;
+	struct remotecache_inode *inode;
+	bool present = false;
 
 	session = remotecache_node_session(this_node);
 	if (!session) {
@@ -1308,21 +1284,37 @@ static void __remotecache_invalidate_page(int pool_id, struct cleancache_filekey
 
 	rc_debug("%s: ino %lu index %lu\n", __func__, key.u.ino, index);
 
-	spin_lock_irqsave(&metadata->lock, flags);
-	erased = __remotecache_metadata_erase(metadata, key.u.ino, index);
-	spin_unlock_irqrestore(&metadata->lock, flags);
+	rcu_read_lock();
+	inode = __remotecache_lookup_inode(metadata, key.u.ino);
+	if (!inode) {
+		rcu_read_unlock();
+		goto out;
+	}
+	present = radix_tree_tag_get(&inode->pages_tree, index,
+			REMOTECACHE_TAG_PRESENT);
+	rcu_read_unlock();
+
+	if (present) {
+		spin_lock_irqsave(&inode->lock, flags);
+		radix_tree_tag_clear(&inode->pages_tree, index,
+				REMOTECACHE_TAG_PRESENT);
+		spin_unlock_irqrestore(&inode->lock, flags);
+	}
 
 	/*
 	 * See comment for __handle_invalidate_page
 	 */
-	if (erased) {
+	if (present) {
 		if (!do_invalidate_page(session, pool_id, key.u.ino, index, false))
 			pr_warn("%s: cannot invalidate page: out of memory\n", __func__);
 
 		this_node->stats.n_invalidate_pages++;
 	}
 
-	remotecache_metadata_put(metadata);
+out:
+	if (inode)
+		remotecache_inode_put(inode);
+	remotecache_put(metadata);
 }
 
 /* rc_invalidate_inode: implementation of the cleancache invalidate_inode call */
@@ -1331,7 +1323,8 @@ static void __remotecache_invalidate_inode(int pool_id, struct cleancache_fileke
 	unsigned long flags;
 	struct rc_msg *request;
 	struct rc_invalidate_ino_request *inv;
-	struct remotecache_metadata *metadata;
+	struct remotecache *metadata;
+	struct remotecache_inode *inode;
 	struct remotecache_session *session;
 	bool erased;
 
@@ -1345,9 +1338,22 @@ static void __remotecache_invalidate_inode(int pool_id, struct cleancache_fileke
 
 	rc_debug("%s: ino %lu\n", __func__, key.u.ino);
 
-	spin_lock_irqsave(&metadata->lock, flags);
-	erased = __remotecache_metadata_erase_inode(metadata, key.u.ino);
-	spin_unlock_irqrestore(&metadata->lock, flags);
+	rcu_read_lock();
+	inode = __remotecache_lookup_inode(metadata, key.u.ino);
+	rcu_read_unlock();
+
+	if (inode) {
+		void **slot;
+		struct radix_tree_iter iter;
+		spin_lock_irqsave(&inode->lock, flags);
+		radix_tree_for_each_tagged(slot, &inode->pages_tree, &iter,
+				0, REMOTECACHE_TAG_PRESENT) {
+			radix_tree_tag_clear(&inode->pages_tree, iter.index,
+					REMOTECACHE_TAG_PRESENT);
+		}
+		spin_unlock_irqrestore(&inode->lock, flags);
+		erased = true;
+	}
 
 	if (!erased)
 		goto out;
@@ -1367,7 +1373,7 @@ static void __remotecache_invalidate_inode(int pool_id, struct cleancache_fileke
 	rc_con_send(&session->con, request);
 
 out:
-	remotecache_metadata_put(metadata);
+	remotecache_put(metadata);
 }
 
 /* rc_invalidate_fs: implementation of the cleancache invalidate_fs call */
@@ -1376,8 +1382,10 @@ static void __remotecache_invalidate_fs(int pool_id)
 	unsigned long flags;
 	struct rc_msg *request;
 	struct rc_invalidate_fs_request *inv;
-	struct remotecache_metadata *metadata;
+	struct remotecache *metadata;
 	struct remotecache_session *session;
+	int bkt;
+	struct remotecache_inode *inode;
 
 	session = remotecache_node_session(this_node);
 	if (!session) {
@@ -1408,11 +1416,22 @@ static void __remotecache_invalidate_fs(int pool_id)
 	rc_con_send(&session->con, request);
 
 	spin_lock_irqsave(&metadata->lock, flags);
-	__remotecache_metadata_clear(metadata);
+	hash_for_each(metadata->inodes_hash, bkt, inode, hash) {
+		void *slot;
+		struct radix_tree_iter iter;
+		unsigned long i_flags;
+		spin_lock_irqsave(&inode->lock, i_flags);
+		radix_tree_for_each_tagged(slot, &inode->pages_tree, &iter,
+				0, REMOTECACHE_TAG_PRESENT) {
+			radix_tree_tag_clear(&inode->pages_tree, iter.index,
+					REMOTECACHE_TAG_PRESENT);
+		}
+		spin_unlock_irqrestore(&inode->lock, i_flags);
+	}
 	spin_unlock_irqrestore(&metadata->lock, flags);
 
 out:
-	remotecache_metadata_put(metadata);
+	remotecache_put(metadata);
 }
 
 /*
@@ -1565,11 +1584,13 @@ static void submit_request_pages(struct remotecache_request *request) {
 
 enum hrtimer_restart request_timeout(struct hrtimer *timer)
 {
-	unsigned long m_flags, r_flags;
-	struct remotecache_metadata *metadata;
+	unsigned long i_flags, r_flags;
+	struct remotecache *metadata;
 	struct remotecache_request *request = container_of(timer,
 			struct remotecache_request, timer);
 	int pool;
+	struct remotecache_inode *inode;
+	ino_t ino;
 
 	/* we already received the response */
 	set_bit(REMOTECACHE_REQUEST_CANCELED, &request->flags);
@@ -1584,26 +1605,39 @@ enum hrtimer_restart request_timeout(struct hrtimer *timer)
 	metadata = remotecache_node_metadata(this_node, pool, NULL_UUID_LE);
 
 	spin_lock_irqsave(&request->lock, r_flags);
-	spin_lock_irqsave(&metadata->lock, m_flags);
+	if (test_bit(REMOTECACHE_REQUEST_HAS_PAGES, &request->flags)) {
+		ino = request->pages[0]->mapping->host->i_ino;
+	} else {
+		ino = request->page->mapping->host->i_ino;
+	}
+	rcu_read_lock();
+	inode = __remotecache_lookup_inode(metadata, ino);
+	rcu_read_unlock();
+
+	spin_lock_irqsave(&inode->lock, i_flags);
 	if (test_bit(REMOTECACHE_REQUEST_HAS_PAGES, &request->flags)) {
 		int i;
 		for (i = 0; i < request->nr_pages; ++i) {
 			struct page *p = request->pages[i];
 			if (!PageUptodate(p))
-				__remotecache_metadata_erase(metadata, p->mapping->host->i_ino, p->index);
+				radix_tree_tag_clear(&inode->pages_tree,
+						p->index,
+						REMOTECACHE_TAG_PRESENT);
 		}
 	} else {
 		struct page *p = request->page;
 		if (!PageUptodate(p))
-			__remotecache_metadata_erase(metadata, p->mapping->host->i_ino, p->index);
+			radix_tree_tag_clear(&inode->pages_tree, p->index,
+					REMOTECACHE_TAG_PRESENT);
 	}
-	spin_unlock_irqrestore(&metadata->lock, m_flags);
+	spin_unlock_irqrestore(&inode->lock, i_flags);
 	spin_unlock_irqrestore(&request->lock, r_flags);
 
 	this_node->stats.n_get_expired += request->nr_pages;
 
 	submit_request_pages(request);
-	remotecache_metadata_put(metadata);
+	remotecache_inode_put(inode);
+	remotecache_put(metadata);
 
 	return HRTIMER_NORESTART;
 }
@@ -1620,8 +1654,10 @@ static void __handle_get_response(struct remotecache_session *session,
 	int pool_id = le32_to_cpu(res->pool_id);
 	ino_t ino = le64_to_cpu(res->ino);
 	int i;
-	struct remotecache_metadata *metadata=
-		remotecache_node_metadata(this_node, pool_id, NULL_UUID_LE);
+	struct remotecache *metadata;
+	struct remotecache_inode *inode;
+
+	metadata = remotecache_node_metadata(this_node, pool_id, NULL_UUID_LE);
 
 	BUG_ON(msg->front.iov_len != sizeof(*res));
 	BUG_ON(!msg->middle.iov_base);
@@ -1649,6 +1685,10 @@ static void __handle_get_response(struct remotecache_session *session,
 		goto out;
 	}
 
+	rcu_read_lock();
+	inode = __remotecache_lookup_inode(metadata, ino);
+	rcu_read_unlock();
+
 	for (i = 0; i < msg->nr_pages; ++i) {
 		unsigned long flags;
 		struct page *page = msg->pages[i];
@@ -1657,27 +1697,11 @@ static void __handle_get_response(struct remotecache_session *session,
 		BUG_ON(page->index != index);
 
 		if (remotecache_strategy == RC_STRATEGY_EXCLUSIVE) {
-			spin_lock_irqsave(&metadata->lock, flags);
-			__remotecache_metadata_erase(metadata, ino, index);
-			spin_unlock_irqrestore(&metadata->lock, flags);
+			spin_lock_irqsave(&inode->lock, flags);
+			radix_tree_tag_clear(&inode->pages_tree, index,
+					REMOTECACHE_TAG_PRESENT);
+			spin_unlock_irqrestore(&inode->lock, flags);
 		}
-#ifdef CONFIG_REMOTECACHE_DEBUG
-		else {
-			struct remotecache_page_metadata *pmd;
-			u32 crc;
-			void *kaddr = kmap_atomic(page);
-			crc = crc32c(0, kaddr, PAGE_SIZE);
-			kunmap_atomic(kaddr);
-
-			spin_lock_irqsave(&metadata->lock, flags);
-			pmd = __remotecache_metadata_lookup(metadata, ino, index);
-			spin_unlock_irqrestore(&metadata->lock, flags);
-			if (pmd) {
-				WARN_ON(crc != pmd->crc);
-				remotecache_page_metadata_put(pmd);
-			}
-		}
-#endif
 		SetPageUptodate(page);
 	}
 	this_node->stats.n_rc_hit += nr_middle;
@@ -1689,23 +1713,26 @@ static void __handle_get_response(struct remotecache_session *session,
 	 */
 	if (res->nr_miss) {
 		unsigned long flags;
-		spin_lock_irqsave(&metadata->lock, flags);
+		spin_lock_irqsave(&inode->lock, flags);
 		if (test_bit(REMOTECACHE_REQUEST_HAS_PAGES, &request->flags)) {
 			int i;
 			for (i = 0; i < request->nr_pages; ++i) {
 				struct page *p = request->pages[i];
 				if (!PageUptodate(p))
-					__remotecache_metadata_erase(metadata,
-							ino, p->index);
+					radix_tree_tag_clear(&inode->pages_tree,
+							p->index,
+							REMOTECACHE_TAG_PRESENT);
 			}
 		} else {
 			if (!PageUptodate(request->page))
-				__remotecache_metadata_erase(metadata, ino,
-						request->page->index);
+				radix_tree_tag_clear(&inode->pages_tree,
+						request->page->index,
+						REMOTECACHE_TAG_PRESENT);
 		}
-		spin_unlock_irqrestore(&metadata->lock, flags);
+		spin_unlock_irqrestore(&inode->lock, flags);
 	}
-	remotecache_metadata_put(metadata);
+	remotecache_inode_put(inode);
+	remotecache_put(metadata);
 	spin_unlock_irqrestore(&request->lock, flags);
 	/*
 	 * Free request and update stats if we received enough responses
@@ -1737,14 +1764,7 @@ static void __handle_put_ack(struct remotecache_session *session, struct rc_msg 
 	int i, pool_id;
 	struct rc_put_request *req;
 	struct timespec delay;
-	struct remotecache_metadata *metadata;
-	struct remotecache_page_metadata *pmd = msg->private;
-	LIST_HEAD(pmd_list);
-
-	/* We correctly initialize rcp_list since msg->private points to the
-	 * first element of the remotecache page list, not to a list head */
-	list_splice_tail(&pmd->lru, &pmd_list);
-	list_add(&pmd->lru, &pmd_list);
+	struct remotecache *metadata;
 
 	req = (struct rc_put_request *)msg->front.iov_base;
 	pool_id = le32_to_cpu(req->pool_id);
@@ -1752,8 +1772,9 @@ static void __handle_put_ack(struct remotecache_session *session, struct rc_msg 
 
 	for (i = 0; i < msg->nr_pages; ++i) {
 		struct page *page;
-		struct remotecache_page_metadata *pmd;
 		struct rc_put_request_middle *middle;
+		struct remotecache_inode *inode;
+		unsigned long flags;
 		ino_t ino;
 		pgoff_t index;
 
@@ -1763,15 +1784,14 @@ static void __handle_put_ack(struct remotecache_session *session, struct rc_msg 
 
 		page = msg->pages[i];
 
-		pmd = list_first_entry(&pmd_list,
-				struct remotecache_page_metadata, lru);
-		list_del_init(&pmd->lru);
+		rcu_read_lock();
+		inode = __remotecache_lookup_inode(metadata, ino);
+		rcu_read_unlock();
 
-		rc_debug("%s: pool %d page %p ino %lu index %lu pmd %p\n",
-			__func__, pool_id, page, ino, index, pmd);
+		BUG_ON(!inode);
 
-		BUG_ON(ino != pmd->ino);
-		BUG_ON(index != pmd->index);
+		rc_debug("%s: pool %d page %p ino %lu index %lu\n",
+			__func__, pool_id, page, ino, index);
 
 		/*
 		 * Processes might be waiting on RC_PAGE_BUSY bit to be
@@ -1780,10 +1800,11 @@ static void __handle_put_ack(struct remotecache_session *session, struct rc_msg 
 		 * pmd->private. Locking is important since a process might be
 		 * trying to copy page content in rc_pending_get_add.
 		 */
-		BUG_ON(!test_and_clear_bit(RC_PAGE_BUSY, &pmd->flags));
-		wake_up_remotecache_page_metadata(pmd, RC_PAGE_BUSY);
+		spin_lock_irqsave(&inode->lock, flags);
+		__remotecache_metadata_clear_busy(inode, index);
+		spin_unlock_irqrestore(&inode->lock, flags);
 
-		remotecache_page_metadata_put(pmd);
+		remotecache_inode_put(inode);
 
 		put_page(page);
 		if (PageRemote(page)) {
@@ -1804,7 +1825,7 @@ static void __handle_put_ack(struct remotecache_session *session, struct rc_msg 
 
 	msg->nr_pages = 0;
 
-	remotecache_metadata_put(metadata);
+	remotecache_put(metadata);
 }
 
 static void remotecache_session_acked(struct rc_connection *con, struct rc_msg *msg)
@@ -1943,42 +1964,37 @@ static int __request_add_page(struct page *page,
 		struct remotecache_request *request)
 {
 	unsigned long flags;
-	int r = 0, pool_id = get_poolid_from_fake(mapping->host->i_sb->cleancache_poolid);
+	int r = 0;
+	int pool_id = get_poolid_from_fake(mapping->host->i_sb->cleancache_poolid);
 	ino_t ino = mapping->host->i_ino;
-	struct remotecache_metadata *metadata =
-		remotecache_node_metadata(this_node, pool_id, NULL_UUID_LE);
-	struct remotecache_page_metadata *pmd = NULL;
+	struct remotecache *metadata = NULL;
+	struct remotecache_inode *inode = NULL;
 
 	if (ino == -1)
 		goto out;
-
-	WARN_ON(PageUptodate(page));
-
-	/* We check if the page is in the remote page cache */
-	spin_lock_irqsave(&metadata->lock, flags);
-	pmd = __remotecache_metadata_lookup(metadata, ino, page->index);
-	if (!pmd) {
-		rc_debug("%s: avoided miss on page %p\n", __func__, page);
-		this_node->stats.n_rc_miss_avoided++;
-		spin_unlock_irqrestore(&metadata->lock, flags);
-		goto out;
-	}
-	spin_unlock_irqrestore(&metadata->lock, flags);
 
 	if (remotecache_suspend_disable_get &&
 			test_bit(REMOTECACHE_SESSION_SUSPENDED,
 				&request->session->flags)) {
 		pr_err("%s: node suspended\n", __func__);
-		goto abort;
+		goto out;
 	}
 
-	/* XXX: Why should we abort if page has buffers ? */
-	/*if (page_has_buffers(page)) {
-		pr_warn("%s: page %p ino %lu index %lu has buffers\n",
-				__func__, page, mapping->host->i_ino,
-				page->index);
-		goto abort;
-	}*/
+	metadata = remotecache_node_metadata(this_node, pool_id, NULL_UUID_LE);
+
+	WARN_ON(PageUptodate(page));
+
+	/* We check if the page is in the remote page cache */
+	rcu_read_lock();
+	inode = __remotecache_lookup_inode(metadata, ino);
+	if (!inode || !radix_tree_tag_get(&inode->pages_tree, page->index,
+				REMOTECACHE_TAG_PRESENT)) {
+		rcu_read_unlock();
+		rc_debug("%s: avoided miss on page %p\n", __func__, page);
+		this_node->stats.n_rc_miss_avoided++;
+		goto out;
+	}
+	rcu_read_unlock();
 
 	/*
 	 * Check if the page is being transferred. Since PUT messages are
@@ -1990,16 +2006,7 @@ static int __request_add_page(struct page *page,
 	 * We wait for RC_PAGE_BUSY bit to be clear, meaning that the server
 	 * received the corresponding message.
 	 */
-	if (test_bit(RC_PAGE_BUSY, &pmd->flags)) {
-		/*
-		 * If we can't copy the page, we have to wait until the page
-		 * is correctly written to the cache to avoid message
-		 * inversion due to buffering
-		 */
-		rc_debug("%s: wait on busy page %p ino %lu index %lu\n",
-			__func__, pmd, mapping->host->i_ino, page->index);
-		wait_on_remotecache_page_metadata_bit(pmd, RC_PAGE_BUSY);
-	}
+	remotecache_metadata_wait_busy(inode, page->index);
 
 	if (test_bit(REMOTECACHE_REQUEST_HAS_PAGES, &request->flags)) {
 		list_del_init(&page->lru);
@@ -2036,14 +2043,12 @@ abort:
 	if (test_bit(REMOTECACHE_REQUEST_HAS_PAGES, &request->flags))
 		page_cache_release(page);
 
-	if (pmd) {
-		rc_debug("%s: abort on page %p ino %lu index %lu\n",
-				__func__, page, mapping->host->i_ino,
-				page->index);
-		spin_lock_irqsave(&metadata->lock, flags);
-		__remotecache_metadata_remove(metadata, pmd);
-		spin_unlock_irqrestore(&metadata->lock, flags);
-	}
+	rc_debug("%s: abort on page %p ino %lu index %lu\n", __func__, page,
+			mapping->host->i_ino, page->index);
+	spin_lock_irqsave(&inode->lock, flags);
+	radix_tree_tag_clear(&inode->pages_tree, page->index,
+			REMOTECACHE_TAG_PRESENT);
+	spin_unlock_irqrestore(&inode->lock, flags);
 	page = NULL;
 
 out:
@@ -2052,9 +2057,10 @@ out:
 	 */
 	if (page && PageUptodate(page))
 		unlock_page(page);
-	if (pmd)
-		remotecache_page_metadata_put(pmd);
-	remotecache_metadata_put(metadata);
+	if (inode)
+		remotecache_inode_put(inode);
+	if (metadata)
+		remotecache_put(metadata);
 	return r;
 }
 

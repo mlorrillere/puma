@@ -29,12 +29,12 @@ struct remotecache_node {
 
 	/* local metadata */
 	struct list_head metadata;
-	spinlock_t m_lock;		/* lock to protect ->metadata */
+	struct mutex m_lock;		/* lock to protect ->metadata */
 
 	/* Remote connections */
 	struct rc_connection con; 	/* Listen connection */
 	struct list_head sessions;
-	spinlock_t s_lock; 		/* lock to protect ->sessions */
+	struct mutex s_lock; 		/* lock to protect ->sessions */
 
 	struct timer_list suspend_timer;
 
@@ -66,7 +66,7 @@ static inline void remotecache_node_put(struct remotecache_node *node)
 	kref_put(&node->kref, remotecache_node_last_put);
 }
 
-struct remotecache_metadata *remotecache_node_metadata(struct remotecache_node *node,
+struct remotecache *remotecache_node_metadata(struct remotecache_node *node,
 		int pool_id, uuid_le uuid);
 
 /* Returns a session to be used.

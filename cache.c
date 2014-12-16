@@ -81,7 +81,7 @@ void remotecache_inode_release(struct kref *ref)
 {
 	struct remotecache_inode *inode =
 		container_of(ref, struct remotecache_inode, kref);
-	unsigned long pos = 0;
+	unsigned long pos = 0, flags;
 	struct page *pages[16];
 	int n;
 
@@ -90,13 +90,16 @@ void remotecache_inode_release(struct kref *ref)
 	do {
 		int i;
 
-		spin_lock(&inode->lock);
+		spin_lock_irqsave(&inode->lock, flags);
 		n = radix_tree_gang_lookup(&inode->pages_tree, (void **)pages,
 				pos, ARRAY_SIZE(pages));
 
 		for (i = 0; i < n; ++i) {
 			struct page *p = pages[i];
 			void *ret;
+
+			if (radix_tree_exceptional_entry(p))
+				continue;
 
 			BUG_ON(!get_page_unless_zero(p));
 			pos = p->index;
@@ -106,7 +109,7 @@ void remotecache_inode_release(struct kref *ref)
 
 		pos++;
 
-		spin_unlock(&inode->lock);
+		spin_unlock_irqrestore(&inode->lock, flags);
 
 		/*
 		 * There is no need to synchronize_rcu as __handle_get checks
@@ -115,6 +118,9 @@ void remotecache_inode_release(struct kref *ref)
 		 */
 		for (i = 0; i < n; ++i) {
 			struct page *p = pages[i];
+
+			if (radix_tree_exceptional_entry(p))
+				continue;
 
 			if (TestClearPageRemote(p)) {
 				ClearPagePrivate(p);
@@ -165,24 +171,23 @@ void remotecache_page_release(struct page *p) {
 void remotecache_clear(struct remotecache *cache)
 {
 	int bucket;
+	unsigned long flags;
 	struct remotecache_inode *ino, *next;
 	struct hlist_node *tmp;
 	LIST_HEAD(inodes_list);
 
-	spin_lock(&cache->lock);
+	spin_lock_irqsave(&cache->lock, flags);
 	hash_for_each_safe(cache->inodes_hash, bucket, tmp, ino, hash) {
 		hash_del_rcu(&ino->hash);
 		list_add(&ino->list, &inodes_list);
 	}
-	spin_unlock(&cache->lock);
+	spin_unlock_irqrestore(&cache->lock, flags);
 
 	synchronize_rcu();
 
 	list_for_each_entry_safe(ino, next, &inodes_list, list) {
 		remotecache_inode_put(ino);
 	}
-
-	WARN_ON(atomic_read(&cache->size) != 0);
 }
 
 void remotecache_release(struct kref *ref)
@@ -190,8 +195,6 @@ void remotecache_release(struct kref *ref)
 	struct remotecache *cache = container_of(ref, struct remotecache, kref);
 
 	rc_debug("%s: remotecache release %p", __func__, cache);
-
-	BUG_ON(!list_empty(&cache->list));
 
 	remotecache_clear(cache);
 }
