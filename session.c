@@ -31,17 +31,22 @@
 bool remotecache_suspend_disable_get = false;
 bool remotecache_slow_put = false;
 int remotecache_timeout_usec = 1000;
-bool remotecache_enable_remote_shadow = false;
+int remotecache_eviction_base_penalty = 0;
 
 module_param_named(suspend_disable_get, remotecache_suspend_disable_get,
 		bool, 0666);
 module_param_named(enable_slow_put, remotecache_slow_put, bool, 0666);
 module_param_named(timeout_usec, remotecache_timeout_usec, int, 0666);
-module_param_named(enable_remote_shadow, remotecache_enable_remote_shadow,
-		bool, 0666);
+module_param_named(eviction_base_penalty, remotecache_eviction_base_penalty,
+		int, 0666);
 
 static void submit_request_pages(struct remotecache_request *request);
 static void remotecache_request_put(struct remotecache_request *r);
+static void mark_remotecache_page_evicted(struct remotecache_inode *, pgoff_t);
+static int remotecache_page_score(struct remotecache_inode *, pgoff_t,
+		unsigned long *score, unsigned long *evict);
+static void remotecache_unpack_shadow(void *, unsigned long *, unsigned long *);
+static void *remotecache_pack_shadow(unsigned long, unsigned long);
 
 struct remotecache_session *remotecache_session_create(
 		struct remotecache_node *node)
@@ -58,7 +63,7 @@ struct remotecache_session *remotecache_session_create(
 	INIT_LIST_HEAD(&session->caches);
 	mutex_init(&session->c_lock);
 	mutex_init(&session->r_lock);
-	session->available = UINT_MAX;
+	session->available = ULONG_MAX;
 	session->flags = 0;
 
 	session->node = node;
@@ -822,6 +827,8 @@ static void __invalidate_page_metadata(struct remotecache_session *session,
 				pr_warn("%s remotecache page (%d,%lu,%lu) not found\n",
 					__func__, pool_id, ino, first);
 			}
+			if (remotecache_eviction_base_penalty > 0)
+				mark_remotecache_page_evicted(inode, first);
 			first++;
 		}
 		spin_unlock_irqrestore(&inode->lock, flags);
@@ -1009,13 +1016,14 @@ static void __remotecache_put_page(int pool_id, struct cleancache_filekey key,
 	struct remotecache_session *session;
 	unsigned long flags;
 	int present = 0;
+	unsigned long score, evict;
+	bool keep_local = TestClearPageKeepLocal(page);
 	BUG_ON(PageRemote(page));
 
 	/* not coming from shrink_page_list */
 	if (page_count(page) != 0 || !PageLocked(page) ||
 			page->mapping->host->i_ino < 2)
 		return;
-
 
 	/*
 	 * TODO: with multiple sessions, return only a useful session or NULL,
@@ -1067,6 +1075,7 @@ static void __remotecache_put_page(int pool_id, struct cleancache_filekey key,
 	rcu_read_lock();
 	present = radix_tree_tag_get(&inode->pages_tree, index,
 			REMOTECACHE_TAG_PRESENT);
+	remotecache_page_score(inode, index, &score, &evict);
 	rcu_read_unlock();
 
 	/*
@@ -1097,8 +1106,10 @@ static void __remotecache_put_page(int pool_id, struct cleancache_filekey key,
 		rcu_read_unlock();
 	}
 
-	if (remotecache_enable_remote_shadow &&
-			!TestClearPageShouldRemote(page)) {
+	if (keep_local && (remotecache_eviction_base_penalty == -1 ||
+				(remotecache_eviction_base_penalty > 0 && evict >= score))) {
+		rc_debug("%s ino %lu page %lu score %lu evict %lu\n", __func__,
+			inode->ino, index, score, evict);
 		this_node->stats.n_refault_put++;
 		goto out_clear_present;
 	}
@@ -1150,8 +1161,8 @@ static void __remotecache_put_page(int pool_id, struct cleancache_filekey key,
 	spin_lock_irqsave(&inode->lock, flags);
 	if (!present) {
 		int error;
-		error = radix_tree_insert(&inode->pages_tree, index,
-				(void *)RADIX_TREE_EXCEPTIONAL_ENTRY);
+		void *shadow = remotecache_pack_shadow(0, 0);
+		error = radix_tree_insert(&inode->pages_tree, index, shadow);
 		if (error && error != -EEXIST) {
 			pr_err("%s radix_tree_insert returned error %d\n",
 					__func__, error);
@@ -1959,6 +1970,116 @@ static void remotecache_session_alloc_data(struct rc_connection *con, struct rc_
 	}
 }
 
+static void remotecache_unpack_shadow(void *shadow, unsigned long *score,
+		unsigned long *evict)
+{
+	unsigned long entry = (unsigned long) shadow;
+	entry >>= RADIX_TREE_EXCEPTIONAL_SHIFT;
+	*score = entry & ((1UL << 16) - 1);
+	entry >>= 16;
+	*evict = entry & ((1UL << 16) - 1);
+}
+
+static void *remotecache_pack_shadow(unsigned long score, unsigned long evict)
+{
+	unsigned long entry;
+
+	entry = evict;
+	entry = (entry << 16) | score;
+	entry = (entry << RADIX_TREE_EXCEPTIONAL_SHIFT);
+
+	return (void *)(entry | RADIX_TREE_EXCEPTIONAL_ENTRY);
+}
+
+static void mark_remotecache_page_accessed(struct remotecache_inode *inode,
+		struct page *page, bool present)
+{
+	unsigned long flags;
+	unsigned long score, evict;
+	void **slot, *shadow;
+	pgoff_t index = page->index;
+
+	spin_lock_irqsave(&inode->lock, flags);
+	slot = radix_tree_lookup_slot(&inode->pages_tree, index);
+	if (!slot) {
+		int error;
+		shadow = remotecache_pack_shadow(PageKeepLocal(page) ? 1 : 0, 0);
+		error = radix_tree_insert(&inode->pages_tree, index, shadow);
+		if (error && error != -EEXIST) {
+			pr_err("%s radix_tree_insert returned error %d\n",
+					__func__, error);
+		}
+		goto out;
+	}
+
+	shadow = radix_tree_deref_slot_protected(slot, &inode->lock);
+	remotecache_unpack_shadow(shadow, &score, &evict);
+
+	if (present) {
+		if (score)
+			score = min_t(unsigned long, score + 1, USHRT_MAX);
+	} else if (PageKeepLocal(page)) {
+		score = min_t(unsigned long, score + 1, USHRT_MAX);
+	} else {
+		evict = max((int) (evict - score), 0);
+		score = 0;
+	}
+
+	shadow = remotecache_pack_shadow(score, evict);
+	radix_tree_replace_slot(slot, shadow);
+
+	rc_debug("%s ino %lu page %lu keep %d new value (%lu %lu)\n", __func__,
+		inode->ino, index, PageKeepLocal(page), score, evict);
+
+out:
+	spin_unlock_irqrestore(&inode->lock, flags);
+}
+
+static void mark_remotecache_page_evicted(struct remotecache_inode *inode,
+		pgoff_t index)
+{
+	unsigned long score;
+	unsigned long evict;
+	void **slot, *shadow;
+
+	slot = radix_tree_lookup_slot(&inode->pages_tree, index);
+	BUG_ON(!slot);
+
+	shadow = radix_tree_deref_slot_protected(slot, &inode->lock);
+	remotecache_unpack_shadow(shadow, &score, &evict);
+
+	if (!evict)
+		evict = remotecache_eviction_base_penalty;
+	else
+		evict = min_t(unsigned long, max(evict * evict, 2UL), USHRT_MAX);
+	score = 0;
+
+	shadow = remotecache_pack_shadow(score, evict);
+	radix_tree_replace_slot(slot, shadow);
+
+	rc_debug("%s ino %lu page %lu new value (%lu %lu)\n", __func__,
+			inode->ino, index, score, evict);
+}
+
+static int remotecache_page_score(struct remotecache_inode *inode,
+		pgoff_t index, unsigned long *score, unsigned long *evict)
+{
+	void **slot, *shadow;
+	*score = 0;
+	*evict = 0;
+
+	slot = radix_tree_lookup_slot(&inode->pages_tree, index);
+	if (!slot) {
+		rc_debug("%s ino %lu page %lu slot not found\n", __func__,
+				inode->ino, index);
+		return 0;
+	}
+
+	shadow = radix_tree_deref_slot(slot);
+	remotecache_unpack_shadow(shadow, score, evict);
+	return *score - *evict;
+}
+
 static int __request_add_page(struct page *page,
 		struct address_space *mapping,
 		struct remotecache_request *request)
@@ -1969,6 +2090,7 @@ static int __request_add_page(struct page *page,
 	ino_t ino = mapping->host->i_ino;
 	struct remotecache *metadata = NULL;
 	struct remotecache_inode *inode = NULL;
+	bool present = false;
 
 	if (ino == -1)
 		goto out;
@@ -1987,14 +2109,20 @@ static int __request_add_page(struct page *page,
 	/* We check if the page is in the remote page cache */
 	rcu_read_lock();
 	inode = __remotecache_lookup_inode(metadata, ino);
-	if (!inode || !radix_tree_tag_get(&inode->pages_tree, page->index,
-				REMOTECACHE_TAG_PRESENT)) {
-		rcu_read_unlock();
+	if (inode)
+		present = radix_tree_tag_get(&inode->pages_tree, page->index,
+				REMOTECACHE_TAG_PRESENT);
+	rcu_read_unlock();
+
+	if (inode && remotecache_eviction_base_penalty > 0)
+		mark_remotecache_page_accessed(inode, page, present);
+
+	if (!inode || !present) {
 		rc_debug("%s: avoided miss on page %p\n", __func__, page);
 		this_node->stats.n_rc_miss_avoided++;
 		goto out;
 	}
-	rcu_read_unlock();
+
 
 	/*
 	 * Check if the page is being transferred. Since PUT messages are
@@ -2009,9 +2137,12 @@ static int __request_add_page(struct page *page,
 	remotecache_metadata_wait_busy(inode, page->index);
 
 	if (test_bit(REMOTECACHE_REQUEST_HAS_PAGES, &request->flags)) {
+		int status;
 		list_del_init(&page->lru);
-		if (!add_to_page_cache_lru(page, mapping,
-					page->index, GFP_KERNEL)) {
+
+		status = add_to_page_cache_lru(page, mapping,
+					page->index, GFP_KERNEL);
+		if (likely(!status)) {
 			rc_debug("%s adding page %lu to req %lu",
 					__func__, page->index, request->id);
 			if (!PageUptodate(page))
@@ -2020,10 +2151,15 @@ static int __request_add_page(struct page *page,
 			page_cache_release(page);
 			goto out;
 		} else {
-			rc_debug("%s: failed to add page %p ino %lu index %lu " \
-					"to page cache lru\n",
+			if (status == -EEXIST) {
+				rc_debug("%s: page index %lu exists\n",
+						__func__, page->index);
+			} else {
+				rc_debug("%s: failed to add page %p ino %lu " \
+					"index %lu to page cache lru\n",
 				__func__, page, mapping->host->i_ino,
 				page->index);
+			}
 			r = 1;
 			goto abort;
 		}
@@ -2040,6 +2176,7 @@ static int __request_add_page(struct page *page,
 	}
 
 abort:
+	ClearPageKeepLocal(page);
 	if (test_bit(REMOTECACHE_REQUEST_HAS_PAGES, &request->flags))
 		page_cache_release(page);
 
@@ -2255,6 +2392,24 @@ void remotecache_node_ll_rw_block(int rw, struct buffer_head *bh)
 	submit_bh(rw, bh);
 }
 
+/*
+ * Count contiguously cached pages from @offset-1 to @offset-@max,
+ * this count is a conservative estimation of
+ * 	- length of the sequential read sequence, or
+ * 	- thrashing threshold in memory tight systems
+ */
+static pgoff_t count_history_pages(struct address_space *mapping,
+				   pgoff_t offset, unsigned long max)
+{
+	pgoff_t head;
+
+	rcu_read_lock();
+	head = page_cache_prev_hole(mapping, offset - 1, max);
+	rcu_read_unlock();
+
+	return offset - 1 - head;
+}
+
 int remotecache_node_readpages(struct file *file,
 		struct address_space *mapping, struct list_head *pages,
 		unsigned nr_pages)
@@ -2263,6 +2418,8 @@ int remotecache_node_readpages(struct file *file,
 	struct remotecache_request *request;
 	struct remotecache_session *session;
 	unsigned nr_to_read = nr_pages;
+	pgoff_t history_size, prev_offset = -1;
+	static ino_t prev_ino = 0;
 
 	rc_debug("%s %s nr_pages %u\n", __func__,
 			file->f_dentry->d_name.name, nr_pages);
@@ -2288,10 +2445,20 @@ int remotecache_node_readpages(struct file *file,
 	list_add_tail(&request->list, &session->requests);
 	mutex_unlock(&session->r_lock);
 
+	history_size = count_history_pages(mapping, file->f_ra.start, 128);
+	if (file->f_ra.prev_pos != -1)
+		prev_offset = (unsigned long long)file->f_ra.prev_pos >> PAGE_CACHE_SHIFT;
+
 	list_for_each_entry_safe_reverse(page, next, pages, lru) {
-		if (__request_add_page(page, mapping, request))
+		if (file->f_ra.size >= file->f_ra.ra_pages && history_size >= 128) {
+			SetPageKeepLocal(page);
+		}
+		if (__request_add_page(page, mapping, request)) {
 			nr_to_read--;
+		}
 	}
+
+	prev_ino = mapping->host->i_ino;
 
 	if (request->nr_pages)
 		__send_request(session, request, mapping);
