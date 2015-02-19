@@ -58,20 +58,21 @@ void __remotecache_metadata_clear_busy(struct remotecache_inode *inode, pgoff_t 
 
 	lockdep_assert_held(&inode->lock);
 
+	smp_mb__before_clear_bit();
 	entry = radix_tree_tag_clear(&inode->pages_tree, index,
 			REMOTECACHE_TAG_BUSY);
 	BUG_ON(!entry);
-
 	smp_mb__after_clear_bit();
 
 	rc_debug("%s inode %lu index %lu value %lx\n", __func__, inode->ino,
-			index, *entry);
+			index, (unsigned long)entry);
 
 	rcu_read_lock();
 	hash_for_each_possible_rcu(busy_pages_hash, bp, hash, inode->ino^index) {
 		if (bp->ino == inode->ino && bp->index == index) {
 			rc_debug("%s inode %lu index %lu bp %p\n", __func__, inode->ino, index, bp);
 			atomic_set(&bp->state, 0);
+			smp_mb__after_clear_bit();
 		}
 	}
 	rcu_read_unlock();
@@ -117,7 +118,9 @@ void remotecache_metadata_wait_busy(struct remotecache_inode *inode, pgoff_t ind
 	 * waiters woken up before we add bp to the hash table.
 	 */
 	synchronize_rcu();
+
 	rcu_read_lock();
+	smp_mb__after_unlock_lock();
 	if (!radix_tree_tag_get(&inode->pages_tree, index,
 			REMOTECACHE_TAG_BUSY)) {
 		rcu_read_unlock();
@@ -131,7 +134,7 @@ void remotecache_metadata_wait_busy(struct remotecache_inode *inode, pgoff_t ind
 		DEFINE_WAIT(wait);
 
 		prepare_to_wait(&wait_busy_page, &wait, TASK_UNINTERRUPTIBLE);
-		if (atomic_read(&bp.state) != 0 && schedule_timeout(15*HZ)) {
+		if (atomic_read(&bp.state) != 0 && !schedule_timeout(5*HZ)) {
 			WARN_ON(true);
 			finish_wait(&wait_busy_page, &wait);
 			goto out;
