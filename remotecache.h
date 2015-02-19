@@ -38,6 +38,8 @@ enum {
 #define	RC_MSG_TYPE_INVALIDATE_PAGE	6 /* INVALIDATE a page */
 #define RC_MSG_TYPE_SUSPEND		7 /* Suspend server side activity */
 #define RC_MSG_TYPE_RESUME		8 /* Resume server side activity */
+#define RC_MSG_TYPE_PING		9
+#define RC_MSG_TYPE_PONG		10
 
 struct rc_put_request {
 	__le32 pool_id;	/* identifier of the source filesystem */
@@ -94,5 +96,13 @@ struct rc_invalidate_page_request_middle {
 			 * invalidated (should be > 0)
 			 */
 } __packed;
+
+struct rc_ping_request {
+	s64 stamp;
+};
+
+struct rc_pong_response {
+	s64 stamp;
+};
 
 #endif /* REMOTECACHE_H */

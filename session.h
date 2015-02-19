@@ -42,10 +42,14 @@ struct remotecache_session {
 	unsigned long flags;
 
 	/* TODO: remote statistics (memory, latency, bandwidth, cpu usage) */
+	u64 latency;
+	u64 latency_15;
 };
 
 enum remotecache_session_flags {
-	REMOTECACHE_SESSION_SUSPENDED
+	REMOTECACHE_SESSION_SUSPENDED,
+	REMOTECACHE_SESSION_HEARTBEAT,
+	REMOTECACHE_SESSION_HEARTBEAT_PENDING,
 };
 
 enum remotecache_request_flags {
@@ -92,6 +96,21 @@ static inline void remotecache_session_get(struct remotecache_session *session)
 static inline void remotecache_session_put(struct remotecache_session *session)
 {
 	kref_put(&session->kref, remotecache_session_last_put);
+}
+
+static inline void remotecache_session_suspend(struct remotecache_session *session)
+{
+       set_bit(REMOTECACHE_SESSION_SUSPENDED, &session->flags);
+}
+
+static inline void remotecache_session_resume(struct remotecache_session *session)
+{
+       clear_bit(REMOTECACHE_SESSION_SUSPENDED, &session->flags);
+}
+
+static inline bool remotecache_session_is_suspended(struct remotecache_session *session)
+{
+       return test_bit(REMOTECACHE_SESSION_SUSPENDED, &session->flags);
 }
 
 void remotecache_session_close(struct remotecache_session *session);

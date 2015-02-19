@@ -24,6 +24,7 @@
 #include "cache.h"
 #include "metadata.h"
 #include "msgpool.h"
+#include "heartbeat.h"
 
 /*
  * Module parameters
@@ -65,6 +66,8 @@ struct remotecache_session *remotecache_session_create(
 	mutex_init(&session->r_lock);
 	session->available = ULONG_MAX;
 	session->flags = 0;
+	session->latency = 0;
+	session->latency_15 = 0;
 
 	session->node = node;
 
@@ -73,6 +76,26 @@ struct remotecache_session *remotecache_session_create(
 	pr_err("%s created session %p node %p\n", __func__, session, node);
 
 	return session;
+}
+
+void remotecache_session_cancel_requests(struct remotecache_session *session)
+{
+	struct remotecache_request *r, *next;
+	LIST_HEAD(requests);
+
+	mutex_lock(&session->r_lock);
+	list_splice_init(&session->requests, &requests);
+	mutex_unlock(&session->r_lock);
+
+	list_for_each_entry_safe(r, next, &requests, list) {
+		pr_err("%s waiting for pending request %lu\n", __func__, r->id);
+		hrtimer_cancel(&r->timer);
+
+		if (!test_bit(REMOTECACHE_REQUEST_CANCELED, &r->flags))
+			submit_request_pages(r);
+		atomic_set(&r->nr_received, r->nr_pages);
+		remotecache_request_put(r);
+	}
 }
 
 void remotecache_session_close(struct remotecache_session *session)
@@ -918,6 +941,10 @@ struct rc_msg * remotecache_session_alloc_msg(struct rc_connection *con,
 	case RC_MSG_TYPE_SUSPEND:
 	case RC_MSG_TYPE_RESUME:
 		msg = rc_msg_new(le16_to_cpu(header->type), 0, 0, 0, GFP_ATOMIC, 0);
+		break;
+	case RC_MSG_TYPE_PING:
+	case RC_MSG_TYPE_PONG:
+		msg = rc_msg_new(le16_to_cpu(header->type), front_len, 0, 0, GFP_ATOMIC, 0);
 		break;
 	default:
 		break;
@@ -1902,6 +1929,12 @@ static void remotecache_session_dispatch(struct rc_connection *con, struct rc_ms
 	case RC_MSG_TYPE_RESUME:
 		__handle_resume(session, msg);
 		break;
+	case RC_MSG_TYPE_PING:
+		heartbeat_handle_ping(session, msg);
+		break;
+	case RC_MSG_TYPE_PONG:
+		heartbeat_handle_pong(session, msg);
+		break;
 	default:
 		pr_err("unhandled message type %d",
 				le16_to_cpu(msg->header.type));
@@ -2095,13 +2128,6 @@ static int __request_add_page(struct page *page,
 	if (ino == -1)
 		goto out;
 
-	if (remotecache_suspend_disable_get &&
-			test_bit(REMOTECACHE_SESSION_SUSPENDED,
-				&request->session->flags)) {
-		pr_err("%s: node suspended\n", __func__);
-		goto out;
-	}
-
 	metadata = remotecache_node_metadata(this_node, pool_id, NULL_UUID_LE);
 
 	WARN_ON(PageUptodate(page));
@@ -2113,6 +2139,16 @@ static int __request_add_page(struct page *page,
 		present = radix_tree_tag_get(&inode->pages_tree, page->index,
 				REMOTECACHE_TAG_PRESENT);
 	rcu_read_unlock();
+
+	if (test_bit(REMOTECACHE_SESSION_SUSPENDED, &request->session->flags) &&
+			(remotecache_suspend_disable_get ||
+			 test_bit(REMOTECACHE_SESSION_HEARTBEAT,
+				 &request->session->flags))) {
+		rc_debug("%s: node suspended\n", __func__);
+		if (present)
+			goto out_clear_present;
+		goto out;
+	}
 
 	if (inode && remotecache_eviction_base_penalty > 0)
 		mark_remotecache_page_accessed(inode, page, present);
@@ -2182,6 +2218,7 @@ abort:
 
 	rc_debug("%s: abort on page %p ino %lu index %lu\n", __func__, page,
 			mapping->host->i_ino, page->index);
+out_clear_present:
 	spin_lock_irqsave(&inode->lock, flags);
 	radix_tree_tag_clear(&inode->pages_tree, page->index,
 			REMOTECACHE_TAG_PRESENT);

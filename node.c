@@ -21,6 +21,7 @@
 #include "cache.h"
 #include "metadata.h"
 #include "msgpool.h"
+#include "heartbeat.h"
 
 struct remotecache_node *this_node;
 static struct cleancache_ops *cleancache_old_ops = NULL;
@@ -236,6 +237,9 @@ static void remotecache_node_close(struct remotecache_node *node)
 	/* cancel current timer */
 	del_timer_sync(&node->suspend_timer);
 
+	/* stop heartbeats */
+	heartbeat_stop(node);
+
 	/* close and free remote nodes */
 	mutex_lock(&node->s_lock);
 	list_splice_init_rcu(&node->sessions, &sessions, synchronize_rcu);
@@ -312,7 +316,7 @@ static void __do_node_suspend(struct remotecache_node *node)
 	struct rc_msg *msg;
 
 	if (!test_and_set_bit(REMOTECACHE_NODE_SUSPENDED, &node->flags)) {
-		rc_debug("%s: suspend remote cache node\n", __func__);
+		pr_err("%s: suspend remote cache node\n", __func__);
 		rcu_read_lock();
 		list_for_each_entry_rcu(session, &node->sessions, list) {
 			rc_debug("%s suspend session %s\n", __func__,
@@ -330,13 +334,16 @@ static void __do_node_suspend(struct remotecache_node *node)
 	}
 }
 
-static void remotecache_node_suspend(struct remotecache_node *node)
+void remotecache_node_suspend(struct remotecache_node *node, unsigned long expires)
 {
 	if (test_bit(REMOTECACHE_NODE_CLOSED, &node->flags))
 		return;
 
-	mod_timer(&node->suspend_timer,
-			jiffies + remotecache_suspend_timeout*HZ/1000);
+	if (expires)
+		mod_timer(&node->suspend_timer, jiffies + expires*HZ/1000);
+	else
+		del_timer_sync(&node->suspend_timer);
+
 
 	if (!test_bit(REMOTECACHE_NODE_SUSPENDED, &node->flags)) {
 		__do_node_suspend(node);
@@ -351,7 +358,7 @@ static void __do_node_resume(struct remotecache_node *node)
 	struct rc_msg *msg;
 
 	if (test_and_clear_bit(REMOTECACHE_NODE_SUSPENDED, &node->flags)) {
-		rc_debug("%s: resume remote cache node\n", __func__);
+		pr_err("%s: resume remote cache node\n", __func__);
 
 		if (test_bit(REMOTECACHE_NODE_CLOSED, &node->flags))
 			return;
@@ -373,12 +380,12 @@ static void __do_node_resume(struct remotecache_node *node)
 	}
 }
 
-static void remotecache_node_resume(struct remotecache_node *node)
+void remotecache_node_resume(struct remotecache_node *node)
 {
 	if (test_bit(REMOTECACHE_NODE_SUSPENDED, &node->flags)) {
 		__do_node_resume(node);
 	} else {
-		pr_warn("%s: server already running\n", __func__);
+		rc_debug("%s: server already running\n", __func__);
 	}
 }
 
@@ -397,7 +404,7 @@ static void remotecache_node_suspend_op(enum remotecache_suspend_mode mode)
 				remotecache_suspend_shadow) ||
 				(mode == REMOTECACHE_SUSPEND_INACTIVE_IS_LOW &&
 				remotecache_suspend_inactive_is_low)) {
-			remotecache_node_suspend(this_node);
+			remotecache_node_suspend(this_node, remotecache_suspend_timeout);
 		}
 	}
 }
@@ -410,7 +417,7 @@ static void remotecache_node_resume_op(void)
 
 static bool remotecache_node_is_suspended_op(void)
 {
-	return test_bit(REMOTECACHE_NODE_SUSPENDED, &this_node->flags);
+	return remotecache_node_is_suspended(this_node);
 }
 
 static int remotecache_node_suspend_param_set(const char *val, const struct kernel_param *kp)
@@ -425,7 +432,7 @@ static int remotecache_node_suspend_param_set(const char *val, const struct kern
 		 return err;
 
 	if (b)
-		 remotecache_node_suspend(this_node);
+		 remotecache_node_suspend(this_node, remotecache_suspend_timeout);
 	else
 		 remotecache_node_resume(this_node);
 
@@ -752,6 +759,8 @@ static struct remotecache_node *create_node(void)
 	if ((err = init_node_network(node)) != 0)
 		goto bad_network;
 
+	heartbeat_start(node);
+
 	pr_err("%s: node %p created\n", __func__, node);
 
 	/*
@@ -944,6 +953,9 @@ static ssize_t node_show_stats(struct rc_stats *stats, char *buf)
 	list_for_each_entry_rcu(s, &n->sessions, list) {
 		count += scnprintf(buf+count, PAGE_SIZE-count,
 			"\thost: %s\n", rc_pr_addr(&s->con.peer_addr));
+		count += scnprintf(buf+count, PAGE_SIZE-count,
+				"\t\tlatency %lluus (exp) %lluus(15s)\n",
+				s->latency / 1000, s->latency_15 / 1000);
 		count += scnprintf(buf+count, PAGE_SIZE-count,
 				"\t\tsend avg %lu.%09lu min %lu.%09lu " \
 				"max %lu.%09lu\n",

@@ -18,6 +18,9 @@
 #include "messenger.h"
 #include "stats.h"
 
+struct address_space;
+struct buffer_head;
+
 extern unsigned short remotecache_port;
 extern ulong remotecache_max_size;
 extern bool remotecache_strategy;
@@ -68,6 +71,14 @@ static inline void remotecache_node_put(struct remotecache_node *node)
 
 struct remotecache *remotecache_node_metadata(struct remotecache_node *node,
 		int pool_id, uuid_le uuid);
+
+void remotecache_node_resume(struct remotecache_node *);
+void remotecache_node_suspend(struct remotecache_node *, unsigned long);
+
+static inline bool remotecache_node_is_suspended(struct remotecache_node *node)
+{
+	return test_bit(REMOTECACHE_NODE_SUSPENDED, &node->flags);
+}
 
 /* Returns a session to be used.
  *
