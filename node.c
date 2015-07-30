@@ -22,6 +22,7 @@
 #include "metadata.h"
 #include "msgpool.h"
 #include "heartbeat.h"
+#include "debugfs.h"
 
 struct remotecache_node *this_node;
 static struct cleancache_ops *cleancache_old_ops = NULL;
@@ -316,7 +317,7 @@ static void __do_node_suspend(struct remotecache_node *node)
 	struct rc_msg *msg;
 
 	if (!test_and_set_bit(REMOTECACHE_NODE_SUSPENDED, &node->flags)) {
-		pr_err("%s: suspend remote cache node\n", __func__);
+		pr_debug("%s: suspend remote cache node\n", __func__);
 		rcu_read_lock();
 		list_for_each_entry_rcu(session, &node->sessions, list) {
 			rc_debug("%s suspend session %s\n", __func__,
@@ -331,6 +332,8 @@ static void __do_node_suspend(struct remotecache_node *node)
 			}
 		}
 		rcu_read_unlock();
+
+		remotecache_debugfs_suspend(false);
 	}
 }
 
@@ -358,7 +361,7 @@ static void __do_node_resume(struct remotecache_node *node)
 	struct rc_msg *msg;
 
 	if (test_and_clear_bit(REMOTECACHE_NODE_SUSPENDED, &node->flags)) {
-		pr_err("%s: resume remote cache node\n", __func__);
+		pr_debug("%s: resume remote cache node\n", __func__);
 
 		if (test_bit(REMOTECACHE_NODE_CLOSED, &node->flags))
 			return;
@@ -377,6 +380,8 @@ static void __do_node_resume(struct remotecache_node *node)
 			}
 		}
 		rcu_read_unlock();
+
+		remotecache_debugfs_suspend(true);
 	}
 }
 
