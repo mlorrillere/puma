@@ -834,12 +834,18 @@ static int remotecache_node_init(void)
 	if (err)
 		return err;
 
-	err = init_caches();
+	err = remotecache_debugfs_init();
 	if (err)
 		goto bad_messenger;
 
+	err = init_caches();
+	if (err)
+		goto bad_debugfs;
+
 	return 0;
 
+bad_debugfs:
+	remotecache_debugfs_exit();
 bad_messenger:
 	rc_messenger_exit();
 
@@ -853,6 +859,7 @@ static void remotecache_node_exit(void)
 	 * TODO: block until node is disabled
 	 */
 	destroy_caches();
+	remotecache_debugfs_exit();
 	rc_messenger_exit();
 }
 
