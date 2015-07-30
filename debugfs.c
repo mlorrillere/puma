@@ -227,4 +227,5 @@ void remotecache_debugfs_exit(void)
 {
 	debugfs_remove_recursive(remotecache_debugfs);
 	suspend_clear();
+	synchronize_rcu();
 }
