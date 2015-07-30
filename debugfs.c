@@ -1,6 +1,6 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
-#include <linux/list.h>
+#include <linux/rculist.h>
 #include <linux/slab.h>
 #include <linux/fs.h>
 #include <linux/debugfs.h>
@@ -13,13 +13,14 @@ static struct dentry *remotecache_debugfs = NULL;
 
 
 struct suspend_state {
+	struct rcu_head rcu;
 	struct list_head list;
 	struct timespec stamp;
 	bool enabled;
 };
 
 static LIST_HEAD(suspend_history);
-static DEFINE_MUTEX(suspend_lock);
+static spinlock_t suspend_lock;
 static bool debugfs_suspend_monitor = false;
 
 module_param_named(suspend_monitor,
@@ -28,29 +29,39 @@ module_param_named(suspend_monitor,
 void remotecache_debugfs_suspend(bool enabled)
 {
 	struct suspend_state *state;
+	unsigned long flags;
 
 	if (!debugfs_suspend_monitor)
 		return;
 
-	state = kzalloc(sizeof(*state), GFP_KERNEL);
+	state = kzalloc(sizeof(*state), GFP_ATOMIC);
 	getnstimeofday(&state->stamp);
 	state->enabled = enabled;
 
-	mutex_lock(&suspend_lock);
-	list_add_tail(&state->list, &suspend_history);
-	mutex_unlock(&suspend_lock);
+	spin_lock_irqsave(&suspend_lock, flags);
+	list_add_tail_rcu(&state->list, &suspend_history);
+	spin_unlock_irqrestore(&suspend_lock, flags);
 }
 
-static void __suspend_clear(void)
+void suspend_state_rcu_free(struct rcu_head *rcu)
 {
-	struct suspend_state *state, *n;
+	struct suspend_state *state = container_of(rcu,
+			struct suspend_state, rcu);
 
-	list_for_each_entry_safe(state, n, &suspend_history, list) {
-		list_del(&state->list);
-		kfree(state);
+	kfree(state);
+}
+
+static void suspend_clear(void)
+{
+	struct suspend_state *state;
+	unsigned long flags;
+
+	spin_lock_irqsave(&suspend_lock, flags);
+	list_for_each_entry_rcu(state, &suspend_history, list) {
+		list_del_rcu(&state->list);
+		call_rcu(&state->rcu, suspend_state_rcu_free);
 	}
-
-	INIT_LIST_HEAD(&suspend_history);
+	spin_unlock_irqrestore(&suspend_lock, flags);
 }
 
 /* File write operation to configure suspend history at run-time. The
@@ -65,26 +76,22 @@ static ssize_t suspend_write(struct file *file, const char __user *user_buf,
 {
 	char buf[64];
 	int buf_size;
-	int ret;
+	int ret = 0;
 
 	buf_size = min(size, (sizeof(buf) - 1));
 	if (strncpy_from_user(buf, user_buf, buf_size) < 0)
 		return -EFAULT;
 	buf[buf_size] = 0;
 
-	ret = mutex_lock_interruptible(&suspend_lock);
-	if (ret < 0)
-		return ret;
-
 	if (strncmp(buf, "clear", 5) == 0) {
 		if (debugfs_suspend_monitor)
-			__suspend_clear();
+			suspend_clear();
 		goto out;
 	}
 
 	if (strncmp(buf, "off", 3) == 0) {
 		debugfs_suspend_monitor = false;
-		__suspend_clear();
+		suspend_clear();
 	} else if (strncmp(buf, "on", 2) == 0) {
 		debugfs_suspend_monitor = true;
 	}
@@ -93,7 +100,6 @@ static ssize_t suspend_write(struct file *file, const char __user *user_buf,
 	}
 
 out:
-	mutex_unlock(&suspend_lock);
 	if (ret < 0)
 		return ret;
 
@@ -110,13 +116,9 @@ static void *suspend_seq_start(struct seq_file *seq, loff_t *pos)
 {
 	struct suspend_state *state;
 	loff_t n = *pos;
-	int err;
 
-	err = mutex_lock_interruptible(&suspend_lock);
-	if (err < 0)
-		return ERR_PTR(err);
-
-	list_for_each_entry(state, &suspend_history, list) {
+	rcu_read_lock();
+	list_for_each_entry_rcu(state, &suspend_history, list) {
 		if (n-- > 0)
 			continue;
 		goto out;
@@ -132,12 +134,14 @@ out:
 static void *suspend_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 {
 	struct suspend_state *state = v;
-	struct suspend_state *next = list_next_entry(state, list);
+	struct list_head *p;
+
 	++(*pos);
 
-	if (&next->list == &suspend_history)
-		next = NULL;
-	return next;
+	p = rcu_dereference(list_next_rcu(&state->list));
+
+	return (p == &suspend_history) ? NULL :
+		list_entry(p, struct suspend_state, list);
 }
 
 /*
@@ -145,13 +149,7 @@ static void *suspend_seq_next(struct seq_file *seq, void *v, loff_t *pos)
  */
 static void suspend_seq_stop(struct seq_file *seq, void *v)
 {
-	if (!IS_ERR(v)) {
-		/*
-		 * suspend_seq_start may return ERR_PTR if the suspend_lock
-		 * waiting was interrupted, so only release it if !IS_ERR.
-		 */
-		mutex_unlock(&suspend_lock);
-	}
+	rcu_read_unlock();
 }
 
 /*
@@ -194,6 +192,8 @@ int remotecache_debugfs_init(void)
 	struct dentry *suspend_file;
 	int err = -EFAULT;
 
+	spin_lock_init(&suspend_lock);
+
 	remotecache_debugfs = debugfs_create_dir("remotecache", NULL);
 	if (!remotecache_debugfs) {
 		pr_err("error when creating debugfs directory\n");
@@ -226,8 +226,5 @@ abort:
 void remotecache_debugfs_exit(void)
 {
 	debugfs_remove_recursive(remotecache_debugfs);
-
-	mutex_lock(&suspend_lock);
-	__suspend_clear();
-	mutex_unlock(&suspend_lock);
+	suspend_clear();
 }
