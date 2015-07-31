@@ -9,7 +9,7 @@
 
 #include "debugfs.h"
 
-static struct dentry *remotecache_debugfs = NULL;
+static struct dentry *remotecache_debugfs;
 
 
 struct suspend_state {
@@ -21,7 +21,7 @@ struct suspend_state {
 
 static LIST_HEAD(suspend_history);
 static spinlock_t suspend_lock;
-static bool debugfs_suspend_monitor = false;
+static bool debugfs_suspend_monitor;
 
 module_param_named(suspend_monitor,
 		debugfs_suspend_monitor, bool, 0666);
@@ -43,7 +43,7 @@ void remotecache_debugfs_suspend(bool enabled)
 	spin_unlock_irqrestore(&suspend_lock, flags);
 }
 
-void suspend_state_rcu_free(struct rcu_head *rcu)
+static void suspend_state_rcu_free(struct rcu_head *rcu)
 {
 	struct suspend_state *state = container_of(rcu,
 			struct suspend_state, rcu);
@@ -94,8 +94,7 @@ static ssize_t suspend_write(struct file *file, const char __user *user_buf,
 		suspend_clear();
 	} else if (strncmp(buf, "on", 2) == 0) {
 		debugfs_suspend_monitor = true;
-	}
-	else {
+	} else {
 		ret = -EINVAL;
 	}
 
@@ -109,8 +108,8 @@ out:
 }
 
 /*
- * Iterate over the suspend_history and return the first valid object at or after
- * the required position with its use_count incremented.
+ * Iterate over the suspend_history and return the first valid object at or
+ * after the required position with its use_count incremented.
  */
 static void *suspend_seq_start(struct seq_file *seq, loff_t *pos)
 {
@@ -214,6 +213,8 @@ int remotecache_debugfs_init(void)
 		err = -ENODEV;
 		goto suspend_file_failure;
 	}
+
+	remotecache_debugfs_suspend(true);
 
 	return 0;
 
