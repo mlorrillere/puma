@@ -84,8 +84,10 @@ static ssize_t suspend_write(struct file *file, const char __user *user_buf,
 	buf[buf_size] = 0;
 
 	if (strncmp(buf, "clear", 5) == 0) {
-		if (debugfs_suspend_monitor)
+		if (debugfs_suspend_monitor) {
 			suspend_clear();
+			remotecache_debugfs_suspend(true);
+		}
 		goto out;
 	}
 
