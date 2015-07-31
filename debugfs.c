@@ -146,25 +146,36 @@ static void *suspend_seq_next(struct seq_file *seq, void *v, loff_t *pos)
 }
 
 /*
- * Decrement the use_count of the last object required, if any.
- */
-static void suspend_seq_stop(struct seq_file *seq, void *v)
-{
-	rcu_read_unlock();
-}
-
-/*
  * Print the information for an unreferenced object to the seq file.
  */
 static int suspend_seq_show(struct seq_file *seq, void *v)
 {
 	struct suspend_state *state = v;
 
+	if (!v) {
+		struct timespec now = {0};
+
+		getnstimeofday(&now);
+		seq_printf(seq, "%ld.%09ld -", now.tv_sec, now.tv_nsec);
+		return 0;
+	}
+
 	seq_printf(seq, "%ld.%09ld %s\n",
 			state->stamp.tv_sec,
 			state->stamp.tv_nsec,
 			state->enabled ? "active" : "inactive");
 	return 0;
+}
+
+/*
+ * Decrement the use_count of the last object required, if any.
+ */
+static void suspend_seq_stop(struct seq_file *seq, void *v)
+{
+	rcu_read_unlock();
+
+	/* Display NULL entry to show current time */
+	suspend_seq_show(seq, NULL);
 }
 
 static const struct seq_operations suspend_seq_ops = {
