@@ -54,6 +54,9 @@ unsigned long remotecache_suspend_timeout = 3000;
 bool remotecache_suspend_inactive_is_low = true;
 bool remotecache_suspend_shadow = true;
 size_t remotecache_mempool_size = 1024;
+unsigned short remotecache_min_active = 5; /* min % of active pages */
+unsigned short remotecache_max_remote = 90; /* max % of remote pages to balance
+					      active/inactive lists */
 
 module_param_named(port, remotecache_port, ushort, 0444);
 module_param_named(store_size, remotecache_max_size, ulong, 0444);
@@ -63,6 +66,8 @@ module_param_named(suspend_inactive_is_low,
 		remotecache_suspend_inactive_is_low, bool, 0444);
 module_param_named(suspend_shadow,
 		remotecache_suspend_shadow, bool, 0444);
+module_param_named(min_active, remotecache_min_active, ushort, 0444);
+module_param_named(max_remote, remotecache_max_remote, ushort, 0444);
 
 /*
  * caches/pools
@@ -482,6 +487,14 @@ static bool remotecache_node_refault(void *shadow)
 	return false;
 }
 
+static int remotecache_node_inactive_is_high(unsigned long active,
+		unsigned long inactive, unsigned long remote)
+{
+	return active > (active + inactive) * remotecache_min_active / 100U &&
+	      remote > inactive * remotecache_max_remote / 100U &&
+	      !remotecache_node_is_suspended(this_node);
+}
+
 struct kernel_param_ops remotecache_node_suspend_param_ops = {
 	.set = remotecache_node_suspend_param_set,
 	.get = remotecache_node_suspend_param_get
@@ -501,7 +514,8 @@ static struct remotecache_ops remotecache_node_ops = {
 	.suspend = remotecache_node_suspend_op,
 	.resume = remotecache_node_resume_op,
 	.is_suspended = remotecache_node_is_suspended_op,
-	.refault = remotecache_node_refault
+	.refault = remotecache_node_refault,
+	.inactive_is_high = remotecache_node_inactive_is_high
 };
 
 /*

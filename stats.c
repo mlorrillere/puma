@@ -111,8 +111,10 @@ static ssize_t store_reset(struct rc_stats *stats, struct rc_stats_attribute *at
 	if (ret != 1)
 		return -EINVAL;
 
-	if (reset)
+	if (reset) {
+		pr_err("reset stats\n");
 		rc_stats_reset(stats);
+	}
 
 	return count;
 }
