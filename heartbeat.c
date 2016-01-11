@@ -57,8 +57,8 @@ void heartbeat_send_ping(struct remotecache_session *session)
 	struct timespec now = {.tv_sec = 0, .tv_nsec = 0};
 
 	if (test_and_set_bit(REMOTECACHE_SESSION_HEARTBEAT_PENDING, &session->flags)) {
-		pr_err("%s heartbeat already sent, disabling session", __func__);
-		heartbeat_suspend_session(session);
+		/* pr_err("%s heartbeat already sent, disabling session", __func__);
+		heartbeat_suspend_session(session); */
 		return;
 	}
 
